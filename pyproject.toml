@@ -1,0 +1,65 @@
+[project]
+name = "reptrace"
+version = "0.1.0"
+description = "Minimal LLM DNA extraction package (RepTrace)."
+authors = [{ name = "RepTrace Project" }]
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "huggingface-hub>=0.23.0",
+    "datasets>=2.14.0",
+    "pandas>=2.0.0",
+    "sentence-transformers>=2.2.2",
+    "scikit-learn>=1.3.0",
+    "tqdm>=4.65.0",
+    "pyyaml>=6.0",
+    "wonderwords>=2.2.0",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.4.0"]
+
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.scripts]
+reptrace = "reptrace.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = [
+    "scripts/calc_dna.sh",
+    "configs/llm_list.txt",
+    "README.md",
+    "LICENSE",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reptrace"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q"

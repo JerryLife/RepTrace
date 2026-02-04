@@ -1,0 +1,4 @@
+# Default model list for batch runs
+# Replace or pass --llm-list to use your own list
+
+distilgpt2

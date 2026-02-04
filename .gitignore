@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+
+# Build
+build/
+dist/
+
+# Caches
+.cache/
+pytest_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data/outputs
+/cache/
+/data/
+/models/
+/log/
+/out/
+/out_no_chat_template/
+/out_phyloLM/
+
+# OS
+.DS_Store
