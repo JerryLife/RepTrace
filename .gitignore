@@ -30,3 +30,6 @@ htmlcov/
 
 # OS
 .DS_Store
+
+
+/uv.lock
