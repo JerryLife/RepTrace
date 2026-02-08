@@ -1,6 +1,6 @@
 [project]
 name = "reptrace"
-version = "1.0.0"
+version = "0.1.0b1"
 description = "Extract LLM DNA vectors — low-dimensional representations that capture functional behavior and model evolution."
 authors = [{ name = "RepTrace Project" }]
 license = { file = "LICENSE" }
