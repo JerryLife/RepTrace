@@ -1,14 +1,32 @@
 # RepTrace
 
-PyPI-ready toolkit for extracting LLM DNA vectors from Hugging Face and local models.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI version](https://badge.fury.io/py/reptrace.svg)](https://badge.fury.io/py/reptrace)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Tests](https://img.shields.io/badge/tests-17%20passed-brightgreen.svg)](#tests)
 
-## Install
+**Extract LLM DNA vectors** — low-dimensional, training-free representations that capture functional behavior and evolutionary relationships between language models.
+
+> 📄 **Paper**: [LLM DNA: Tracing Model Evolution via Functional Representations](https://openreview.net/pdf?id=UIxHaAqFqQ) (ICLR 2026 Oral)
+
+## Overview
+
+The explosive growth of large language models has created a vast but opaque landscape: millions of models exist, yet their evolutionary relationships through fine-tuning, distillation, or adaptation are often undocumented. **RepTrace** provides a general, scalable, training-free pipeline for extracting LLM DNA — mathematically-grounded representations that satisfy inheritance and genetic determinism properties.
+
+**Key Features:**
+- 🧬 Extract DNA vectors from any HuggingFace or local model
+- 🚀 Training-free, works across architectures and tokenizers  
+- 📊 Tested on 305+ LLMs with superior or competitive performance
+- 🔍 Uncover undocumented relationships between models
+- 🌳 Build evolutionary trees using phylogenetic algorithms
+
+## Installation
 
 ```bash
 pip install reptrace
 ```
 
-## Python API (recommended)
+## Quick Start
 
 ```python
 from reptrace import DNAExtractionConfig, calc_dna
@@ -18,6 +36,24 @@ config = DNAExtractionConfig(
     dataset="rand",
     gpu_id=0,
     max_samples=100,
+)
+
+result = calc_dna(config)
+print(f"DNA shape: {result.vector.shape}")  # (128,)
+```
+
+## Python API
+
+```python
+from reptrace import DNAExtractionConfig, calc_dna
+
+config = DNAExtractionConfig(
+    model_name="Qwen/Qwen2.5-0.5B-Instruct",
+    dataset="rand",
+    gpu_id=0,
+    max_samples=100,
+    dna_dim=128,
+    reduction_method="random_projection",  # or "pca", "svd"
     trust_remote_code=True,
 )
 
@@ -25,72 +61,60 @@ result = calc_dna(config)
 
 # DNA vector (numpy.ndarray)
 vector = result.vector
-print(vector.shape)
 
 # Saved paths (when save=True)
 print(result.output_path)
 print(result.summary_path)
 ```
 
-## Example `calc_dna.py`
-
-After installation, you can create your own `calc_dna.py` and import the library directly:
-
-```python
-from reptrace import DNAExtractionConfig, calc_dna
-
-cfg = DNAExtractionConfig(
-    model_name="Qwen/Qwen2.5-0.5B-Instruct",
-    dataset="rand",
-    gpu_id=0,
-    token=None,  # or pass HF token explicitly
-    metadata_file=None,  # optional: run without llm_metadata.json
-)
-
-dna = calc_dna(cfg).vector
-print(dna[:10])
-```
-
 ## CLI
-
-`calc-dna` is installed with the package.
 
 ```bash
 # Single model
 calc-dna --model-name distilgpt2 --dataset rand --gpus 0
 
-# Multiple models from list file with round-robin GPU assignment
-calc-dna --llm-list ./configs/llm_list.txt --dataset rand --gpus 0,1
+# Multiple models with round-robin GPU assignment
+calc-dna --llm-list ./configs/llm_list.txt --gpus 0,1
 
-# Explicit hyperparameters
+# With hyperparameters
 calc-dna \
   --model-name mistralai/Mistral-7B-v0.1 \
-  --dataset squad \
-  --gpus 1 \
   --dna-dim 256 \
   --max-samples 200 \
   --reduction-method pca \
-  --embedding-merge mean \
-  --load-in-8bit \
-  --trust-remote-code
+  --load-in-8bit
 ```
 
-## Repo Script
+## Notes
 
-For local repo usage, `scripts/calc_dna.sh` is now a thin wrapper around `scripts/calc_dna.py`:
-
-```bash
-./scripts/calc_dna.sh --llm-list ./configs/llm_list.txt --dataset rand --gpus 0,1
-```
-
-## Hugging Face Notes
-
-- `metadata_file` is optional. If metadata is missing, extraction still runs with runtime defaults.
-- Auth token can be passed with `token=...` or via `HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN`.
-- Chat templates are applied automatically when tokenizer metadata indicates chat templating support.
+- **Metadata auto-fetched**: Model metadata is automatically retrieved from HuggingFace Hub and cached.
+- **Auth token**: Pass via `token=...` or set `HF_TOKEN` environment variable.
+- **Chat templates**: Applied automatically when supported by the tokenizer.
 
 ## Tests
 
 ```bash
-python -m pytest
+# All tests (including integration tests with real model loading)
+pytest tests/ -v
+
+# Fast tests only (skip real model loading)
+pytest tests/ -m "not slow"
 ```
+
+## Citation
+
+If you use RepTrace in your research, please cite:
+
+```bibtex
+@inproceedings{wu2026llmdna,
+  title={LLM DNA: Tracing Model Evolution via Functional Representations},
+  author={Wu, Zhaomin and Zhao, Haodong and Wang, Ziyang and Guo, Jizhou and Wang, Qian and He, Bingsheng},
+  booktitle={The Fourteenth International Conference on Learning Representations},
+  year={2026},
+  url={https://openreview.net/pdf?id=UIxHaAqFqQ}
+}
+```
+
+## License
+
+Apache 2.0

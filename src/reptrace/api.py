@@ -85,28 +85,32 @@ def _default_model_metadata(model_name: str) -> Dict[str, Any]:
 def _load_model_metadata_for_model(
     model_name: str,
     metadata_file: Optional[Path],
+    token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if metadata_file is None:
-        return _default_model_metadata(model_name)
+    """Load model metadata from file or fetch from HuggingFace Hub."""
+    # Try to load from metadata file first
+    if metadata_file is not None:
+        try:
+            from .core import extraction as core
+            all_metadata = core.load_model_metadata(metadata_file)
+            model_meta = all_metadata.get(model_name)
+            if model_meta:
+                return model_meta
+        except Exception as exc:
+            logging.debug("Failed to load metadata file %s: %s", metadata_file, exc)
 
+    # Fetch metadata from HuggingFace Hub (with caching)
+    logging.info("Fetching metadata for '%s' from HuggingFace Hub...", model_name)
     try:
-        from .core import extraction as core
-
-        all_metadata = core.load_model_metadata(metadata_file)
+        from .utils.metadata import get_model_metadata
+        return get_model_metadata(model_name, token=token)
     except Exception as exc:
-        logging.warning("Failed to load metadata file %s: %s", metadata_file, exc)
-        return _default_model_metadata(model_name)
-
-    model_meta = all_metadata.get(model_name)
-    if model_meta:
-        return model_meta
-
-    logging.info(
-        "Metadata for model '%s' not found in %s. Proceeding with runtime defaults.",
-        model_name,
-        metadata_file,
-    )
-    return _default_model_metadata(model_name)
+        logging.warning("Failed to fetch metadata for '%s': %s", model_name, exc)
+        return {
+            "model_name": model_name,
+            "architecture": {"is_generative": True},
+            "repository": {},
+        }
 
 
 def _resolve_model_path(model_path: Optional[str], model_meta: Dict[str, Any]) -> Optional[str]:
@@ -229,7 +233,7 @@ def calc_dna(config: DNAExtractionConfig) -> DNAExtractionResult:
     metadata_file = Path(config.metadata_file) if config.metadata_file is not None else None
     resolved_device = _resolve_device(config)
     resolved_token = _resolve_hf_token(config.token)
-    model_meta = _load_model_metadata_for_model(config.model_name, metadata_file)
+    model_meta = _load_model_metadata_for_model(config.model_name, metadata_file, token=resolved_token)
 
     is_generative = model_meta.get("architecture", {}).get("is_generative")
     if is_generative is False:
