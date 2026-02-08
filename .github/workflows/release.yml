@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    # Branches that should auto-publish snapshot releases to GitHub.
+    branches:
+      - main
+      - "release/**"
+      - "hotfix/**"
+    # Tags that should publish official releases.
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Distributions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Build Tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Validate Artifacts
+        run: python -m twine check dist/*
+
+      - name: Upload Dist Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  github_snapshot_release:
+    name: GitHub Snapshot Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'branch' && (github.ref_name == 'main' || startsWith(github.ref_name, 'release/') || startsWith(github.ref_name, 'hotfix/'))
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Dist Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create Branch Snapshot Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH_SLUG="${GITHUB_REF_NAME//\//-}"
+          TAG="snapshot-${BRANCH_SLUG}-${GITHUB_RUN_NUMBER}"
+          TITLE="Snapshot ${GITHUB_REF_NAME} #${GITHUB_RUN_NUMBER}"
+          NOTES="Automated snapshot release for branch '${GITHUB_REF_NAME}' at commit ${GITHUB_SHA}."
+
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes "$NOTES" \
+            --prerelease
+
+  github_tag_release:
+    name: GitHub Tag Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Dist Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  pypi_publish:
+    name: Publish To PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/reptrace
+
+    steps:
+      - name: Download Dist Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish Distributions
+        uses: pypa/gh-action-pypi-publish@release/v1
