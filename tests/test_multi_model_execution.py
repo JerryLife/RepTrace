@@ -137,6 +137,37 @@ def test_cli_model_parameters_are_forwarded(monkeypatch):
     assert cfg.model_type == "huggingface"
 
 
+def test_cli_llm_list_batch_mode_uses_parallel_api(monkeypatch, tmp_path):
+    llm_list_path = tmp_path / "llm_list.txt"
+    llm_list_path.write_text("distilgpt2\ngpt2\n", encoding="utf-8")
+    captured_kwargs = {}
+
+    def fake_calc_dna_parallel(**kwargs):
+        captured_kwargs.update(kwargs)
+        return [
+            _fake_result(model_name="distilgpt2", dim=16),
+            _fake_result(model_name="gpt2", dim=16),
+        ]
+
+    monkeypatch.setattr(api, "calc_dna_parallel", fake_calc_dna_parallel)
+
+    exit_code = cli_main(
+        [
+            "--llm-list",
+            str(llm_list_path),
+            "--gpus",
+            "0,1",
+            "--no-save",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured_kwargs["llm_list"] == llm_list_path
+    assert captured_kwargs["gpu_ids"] == [0, 1]
+    assert captured_kwargs["continue_on_error"] is False
+    assert isinstance(captured_kwargs["config"], DNAExtractionConfig)
+
+
 def test_cli_continue_on_error_runs_remaining_models(monkeypatch):
     attempted_models: list[str] = []
 

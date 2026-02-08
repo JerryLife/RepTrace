@@ -170,7 +170,7 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     """Main CLI entrypoint for DNA extraction."""
-    from .api import DNAExtractionConfig, calc_dna
+    from .api import DNAExtractionConfig, calc_dna, calc_dna_parallel
 
     args = parse_arguments(argv)
 
@@ -186,6 +186,56 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     failures = 0
     single_model_run = len(model_names) == 1
+
+    # Batch mode for llm_list: schedule model generation across worker devices.
+    if not args.model_name and len(model_names) > 1:
+        batch_config = DNAExtractionConfig(
+            model_name=model_names[0],
+            model_path=args.model_path,
+            model_type=args.model_type,
+            dataset=args.dataset,
+            probe_set=args.probe_set,
+            max_samples=args.max_samples,
+            data_root=args.data_root,
+            extractor_type=args.extractor_type,
+            dna_dim=args.dna_dim,
+            reduction_method=args.reduction_method,
+            embedding_merge=args.embedding_merge,
+            max_length=args.max_length,
+            output_dir=args.output_dir,
+            output_path=None,
+            save=not args.no_save,
+            load_in_8bit=args.load_in_8bit,
+            load_in_4bit=args.load_in_4bit,
+            no_quantization=args.no_quantization,
+            metadata_file=args.metadata_file,
+            token=args.token,
+            trust_remote_code=args.trust_remote_code,
+            device=args.device,
+            gpu_id=None,
+            log_level=args.log_level,
+            random_seed=args.random_seed,
+            skip_chat_template=args.skip_chat_template,
+        )
+        try:
+            results = calc_dna_parallel(
+                config=batch_config,
+                llm_list=args.llm_list,
+                gpu_ids=gpu_ids if gpu_ids else None,
+                continue_on_error=args.continue_on_error,
+            )
+        except Exception as exc:
+            logging.error("Batch DNA extraction failed: %s", exc)
+            return 1
+
+        for result in results:
+            output_message = f"model={result.model_name} dim={result.vector.shape[0]}"
+            if result.output_path is not None:
+                output_message += f" saved={result.output_path}"
+            print(output_message)
+            if args.print_vector:
+                print(json.dumps(result.vector.tolist()))
+        return 0 if len(results) == len(model_names) else 1
 
     for index, model_name in enumerate(model_names):
         gpu_id = None
