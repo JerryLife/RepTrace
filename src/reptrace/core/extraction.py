@@ -61,7 +61,7 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--model-type",
         type=str,
         default="auto",
-        choices=["auto", "huggingface", "openai", "anthropic"],
+        choices=["auto", "huggingface", "openai", "gemini"],
         help="Type of model to load"
     )
     

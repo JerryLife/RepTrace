@@ -8,7 +8,7 @@ from pathlib import Path
 import logging
 
 import torch
-from .ModelWrapper import (LLMWrapper, HuggingFaceWrapper, OpenAIWrapper, AnthropicWrapper,
+from .ModelWrapper import (LLMWrapper, HuggingFaceWrapper, OpenAIWrapper, GeminiWrapper,
                            DecoderOnlyWrapper, EncoderOnlyWrapper, EncoderDecoderWrapper)
 
 
@@ -31,7 +31,7 @@ class ModelLoader:
         
         Args:
             model_path_or_name: Path to local model or HuggingFace model name
-            model_type: Type of model ("auto", "huggingface", "openai", "anthropic")
+            model_type: Type of model ("auto", "huggingface", "openai", "gemini", "anthropic")
             device: Device for computation
             **kwargs: Additional arguments for model loading
             
@@ -48,29 +48,32 @@ class ModelLoader:
             return self._load_huggingface_model(model_path_or_name, device, **kwargs)
         elif model_type == "openai":
             return self._load_openai_model(model_path_or_name, **kwargs)
-        elif model_type == "anthropic":
-            return self._load_anthropic_model(model_path_or_name, **kwargs)
+        elif model_type == "gemini":
+            return self._load_gemini_model(model_path_or_name, **kwargs)
         else:
-            raise ValueError(f"Unsupported model type: {model_type}")
+            raise ValueError(f"Unsupported model type: {model_type}. Supported: huggingface, openai, gemini")
             
     def _detect_model_type(self, model_path_or_name: str) -> str:
         """Auto-detect model type based on path/name patterns."""
-        # Check for OpenAI model names
-        openai_models = [
-            "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o",
-            "text-davinci-003", "text-curie-001", "text-babbage-001"
+        # Check for OpenAI model names (including newer models)
+        openai_prefixes = [
+            "gpt-3.5", "gpt-4", "gpt-4o", "gpt-4-turbo",
+            "o1-", "o3-",  # Reasoning models
+            "text-davinci", "text-curie", "text-babbage", "text-ada",
         ]
         
-        if any(model_path_or_name.startswith(name) for name in openai_models):
+        model_lower = model_path_or_name.lower()
+        if any(model_lower.startswith(prefix) for prefix in openai_prefixes):
             return "openai"
-            
-        # Check for Anthropic model names
-        anthropic_models = [
-            "claude-3", "claude-2", "claude-instant"
+
+        # Check for Google Gemini model names
+        gemini_prefixes = [
+            "gemini-",
+            "models/gemini-",
+            "gemini-pro",  # Older naming
         ]
-        
-        if any(model_path_or_name.startswith(name) for name in anthropic_models):
-            return "anthropic"
+        if any(model_lower.startswith(prefix) for prefix in gemini_prefixes):
+            return "gemini"
             
         # Check if it's a local path
         if os.path.exists(model_path_or_name):
@@ -206,35 +209,56 @@ class ModelLoader:
         """Load OpenAI model."""
         # Get API key from environment if not provided
         if api_key is None:
-            api_key = os.getenv("OPENAI_API_KEY")
+            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("APIKEY_OPENAI")
             
         if api_key is None:
             raise ValueError("OpenAI API key required. Set OPENAI_API_KEY environment variable.")
+
+        allowed_kwargs = {
+            "batch_poll_interval_seconds",
+            "batch_timeout_seconds",
+            "batch_max_requests",
+            "prefer_batch_api",
+        }
+        wrapper_kwargs = {key: value for key, value in kwargs.items() if key in allowed_kwargs}
             
         return OpenAIWrapper(
             model_name=model_name,
             api_key=api_key,
-            **kwargs
+            **wrapper_kwargs
         )
-        
-    def _load_anthropic_model(
+
+    def _load_gemini_model(
         self,
         model_name: str,
         api_key: Optional[str] = None,
         **kwargs
-    ) -> AnthropicWrapper:
-        """Load Anthropic model."""
-        # Get API key from environment if not provided
+    ) -> GeminiWrapper:
+        """Load Gemini model."""
         if api_key is None:
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-            
+            api_key = (
+                os.getenv("GEMINI_API_KEY")
+                or os.getenv("GOOGLE_API_KEY")
+                or os.getenv("APIKEY_GOOGLE")
+            )
+
         if api_key is None:
-            raise ValueError("Anthropic API key required. Set ANTHROPIC_API_KEY environment variable.")
-            
-        return AnthropicWrapper(
+            raise ValueError("Gemini API key required. Set GEMINI_API_KEY or GOOGLE_API_KEY.")
+
+        allowed_kwargs = {
+            "api_base",
+            "batch_poll_interval_seconds",
+            "batch_timeout_seconds",
+            "batch_max_requests",
+            "batch_max_payload_bytes",
+            "prefer_batch_api",
+        }
+        wrapper_kwargs = {key: value for key, value in kwargs.items() if key in allowed_kwargs}
+
+        return GeminiWrapper(
             model_name=model_name,
             api_key=api_key,
-            **kwargs
+            **wrapper_kwargs
         )
     
     def _is_unsupported_model(self, model_name: str) -> bool:
@@ -272,8 +296,8 @@ class ModelLoader:
             return self._list_huggingface_models()
         elif model_type == "openai":
             return self._list_openai_models()
-        elif model_type == "anthropic":
-            return self._list_anthropic_models()
+        elif model_type == "gemini":
+            return self._list_gemini_models()
         else:
             return {}
             
@@ -333,17 +357,15 @@ class ModelLoader:
                 "text-ada-001"
             ]
         }
-        
-    def _list_anthropic_models(self) -> Dict[str, Any]:
-        """List available Anthropic models."""
+
+    def _list_gemini_models(self) -> Dict[str, Any]:
+        """List available Gemini models."""
         return {
             "chat_models": [
-                "claude-3-opus-20240229",
-                "claude-3-sonnet-20240229",
-                "claude-3-haiku-20240307",
-                "claude-2.1",
-                "claude-2.0",
-                "claude-instant-1.2"
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-lite",
+                "gemini-1.5-pro",
+                "gemini-1.5-flash",
             ]
         }
         
@@ -367,7 +389,7 @@ class ModelLoader:
         
         if model_type == "huggingface":
             info.update(self._get_huggingface_info(model_path_or_name))
-        elif model_type in ["openai", "anthropic"]:
+        elif model_type in ["openai", "gemini", "anthropic"]:
             info.update({"requires_api_key": True})
             
         return info
@@ -404,7 +426,7 @@ def load_model(
     
     Args:
         model_path_or_name: Model identifier
-        model_type: Model type ("auto", "huggingface", "openai", "anthropic")
+        model_type: Model type ("auto", "huggingface", "openai", "gemini", "anthropic")
         device: Computation device
         config_dict: Model configuration dictionary
         **kwargs: Additional model loading arguments

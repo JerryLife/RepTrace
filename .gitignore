@@ -33,3 +33,4 @@ htmlcov/
 
 
 /uv.lock
+/.env

@@ -1,6 +1,6 @@
 [project]
 name = "reptrace"
-version = "0.1.0b1"
+version = "0.1.1b1"
 description = "Extract LLM DNA vectors — low-dimensional representations that capture functional behavior and model evolution."
 authors = [{ name = "RepTrace Project" }]
 license = { file = "LICENSE" }
@@ -30,6 +30,8 @@ dependencies = [
     "tqdm>=4.65.0",
     "pyyaml>=6.0",
     "wonderwords>=2.2.0",
+    "openai>=1.0.0",
+    "tiktoken>=0.7.0",
 ]
 
 [project.optional-dependencies]

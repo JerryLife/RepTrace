@@ -3,11 +3,15 @@ Unified interface for different LLM types.
 """
 
 import os
+import io
+import json
 import torch
 import numpy as np
 from typing import List, Dict, Any, Optional, Union, Tuple
 from abc import ABC, abstractmethod
 import logging
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
 from transformers import (
     AutoModel, AutoTokenizer, AutoModelForCausalLM,
     GenerationConfig, BitsAndBytesConfig
@@ -138,6 +142,16 @@ class LLMWrapper(ABC):
                 self.logger.error(f"Batch item failed: {e}")
                 outputs.append("")
         return outputs
+
+    @staticmethod
+    def _iter_chunks(items: List[Any], chunk_size: int) -> List[Tuple[int, List[Any]]]:
+        """Split a list into (start_index, chunk) tuples."""
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be > 0")
+        chunks: List[Tuple[int, List[Any]]] = []
+        for start in range(0, len(items), chunk_size):
+            chunks.append((start, items[start:start + chunk_size]))
+        return chunks
         
     @abstractmethod
     def get_logits(self, input_text: str) -> torch.Tensor:
@@ -1111,22 +1125,180 @@ class OpenAIWrapper(LLMWrapper):
         self,
         model_name: str,
         api_key: Optional[str] = None,
-        device: str = "cpu"  # API models don't use local device
+        device: str = "cpu",  # API models don't use local device
+        batch_poll_interval_seconds: float = 10.0,
+        batch_timeout_seconds: Optional[float] = None,
+        batch_max_requests: int = 512,
+        prefer_batch_api: bool = True,
     ):
         super().__init__(model_name, device)
+        api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("APIKEY_OPENAI")
         
         try:
             import openai
             self.client = openai.OpenAI(api_key=api_key)
         except ImportError:
             raise ImportError("OpenAI package not installed. Install with: pip install openai")
+
+        self.batch_poll_interval_seconds = max(0.1, float(batch_poll_interval_seconds))
+        self.batch_timeout_seconds = batch_timeout_seconds
+        self.batch_max_requests = max(1, int(batch_max_requests))
+        self.prefer_batch_api = bool(prefer_batch_api)
             
         # OpenAI models don't have local tokenizers, use tiktoken
         try:
             import tiktoken
             self.tokenizer = tiktoken.encoding_for_model(model_name)
         except Exception:
-            self.tokenizer = tiktoken.get_encoding("cl100k_base")  # Default encoding
+            try:
+                import tiktoken
+                self.tokenizer = tiktoken.get_encoding("cl100k_base")  # Default encoding
+            except Exception:
+                self.tokenizer = None
+
+    @staticmethod
+    def _extract_openai_text(choice: Dict[str, Any]) -> str:
+        message = choice.get("message", {}) if isinstance(choice, dict) else {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            return "\n".join(parts).strip()
+        return ""
+
+    @staticmethod
+    def _parse_custom_id(custom_id: Any) -> Optional[int]:
+        if not isinstance(custom_id, str):
+            return None
+        prefix = "prompt_"
+        if not custom_id.startswith(prefix):
+            return None
+        try:
+            return int(custom_id[len(prefix):])
+        except ValueError:
+            return None
+
+    def _build_openai_batch_requests(
+        self,
+        prompts: List[str],
+        start_index: int,
+        max_length: int,
+        temperature: float,
+        do_sample: bool,
+        top_p: float,
+        request_kwargs: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        requests: List[Dict[str, Any]] = []
+        for offset, prompt in enumerate(prompts):
+            request = {
+                "custom_id": f"prompt_{start_index + offset}",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": int(max_length),
+                    "temperature": float(temperature),
+                    "top_p": float(top_p if do_sample else 1.0),
+                    **request_kwargs,
+                },
+            }
+            requests.append(request)
+        return requests
+
+    def _submit_openai_batch(self, requests: List[Dict[str, Any]], completion_window: str) -> str:
+        payload_lines = [json.dumps(request, ensure_ascii=False) for request in requests]
+        payload = "\n".join(payload_lines).encode("utf-8")
+        file_obj = io.BytesIO(payload)
+        file_obj.name = "reptrace_batch_requests.jsonl"
+        uploaded = self.client.files.create(file=file_obj, purpose="batch")
+        batch = self.client.batches.create(
+            input_file_id=uploaded.id,
+            endpoint="/v1/chat/completions",
+            completion_window=completion_window,
+        )
+        self.logger.info("OpenAI batch submitted: id=%s size=%d", batch.id, len(requests))
+        return batch.id
+
+    def _wait_openai_batch(
+        self,
+        batch_id: str,
+        poll_interval_seconds: float,
+        timeout_seconds: Optional[float],
+    ) -> Any:
+        started = time.time()
+        last_status: Optional[str] = None
+        while True:
+            batch = self.client.batches.retrieve(batch_id)
+            status = str(getattr(batch, "status", "")).lower()
+            if status != last_status:
+                self.logger.info("OpenAI batch %s status=%s", batch_id, status)
+                last_status = status
+
+            if status in {"completed", "done"}:
+                return batch
+            if status in {"failed", "cancelled", "canceled", "expired", "error"}:
+                error_obj = getattr(batch, "error", None)
+                raise RuntimeError(f"OpenAI batch {batch_id} failed with status={status}: {error_obj}")
+
+            if timeout_seconds is not None and (time.time() - started) > timeout_seconds:
+                try:
+                    self.client.batches.cancel(batch_id)
+                except Exception:
+                    pass
+                raise TimeoutError(f"OpenAI batch {batch_id} timed out after {timeout_seconds}s")
+
+            time.sleep(max(0.1, poll_interval_seconds))
+
+    def _download_openai_output(self, output_file_id: str) -> bytes:
+        output = self.client.files.content(output_file_id)
+        if isinstance(output, bytes):
+            return output
+        if isinstance(output, str):
+            return output.encode("utf-8")
+        if hasattr(output, "read"):
+            raw = output.read()
+            if isinstance(raw, bytes):
+                return raw
+            if isinstance(raw, str):
+                return raw.encode("utf-8")
+        raise ValueError("Unsupported OpenAI file content type")
+
+    def _parse_openai_batch_output(self, raw_content: bytes) -> Dict[int, str]:
+        responses: Dict[int, str] = {}
+        text = raw_content.decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                self.logger.warning("Skipping invalid OpenAI batch JSONL line: %s", line[:120])
+                continue
+
+            index = self._parse_custom_id(record.get("custom_id"))
+            if index is None:
+                continue
+
+            response_obj = record.get("response", {})
+            body = response_obj.get("body", response_obj) if isinstance(response_obj, dict) else {}
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body)
+                except json.JSONDecodeError:
+                    body = {}
+
+            choices = body.get("choices", []) if isinstance(body, dict) else []
+            if not choices:
+                responses[index] = ""
+                continue
+            responses[index] = self._extract_openai_text(choices[0])
+        return responses
             
     def generate(
         self,
@@ -1151,6 +1323,80 @@ class OpenAIWrapper(LLMWrapper):
         except Exception as e:
             self.logger.error(f"OpenAI API error: {e}")
             return ""
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_length: int = 1024,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> List[str]:
+        if not prompts:
+            return []
+
+        prefer_batch_api = bool(kwargs.pop("prefer_batch_api", self.prefer_batch_api))
+        max_requests = int(kwargs.pop("batch_max_requests", self.batch_max_requests))
+        poll_interval = float(kwargs.pop("batch_poll_interval_seconds", self.batch_poll_interval_seconds))
+        timeout = kwargs.pop("batch_timeout_seconds", self.batch_timeout_seconds)
+        completion_window = str(kwargs.pop("batch_completion_window", "24h"))
+
+        # Wrapper-only kwargs should not be forwarded to the provider payload.
+        kwargs.pop("skip_chat_template", None)
+
+        if not prefer_batch_api:
+            return super().generate_batch(
+                prompts,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+                **kwargs,
+            )
+
+        responses: List[str] = [""] * len(prompts)
+        try:
+            chunks = self._iter_chunks(prompts, max(1, max_requests))
+            for start_index, prompt_chunk in chunks:
+                batch_requests = self._build_openai_batch_requests(
+                    prompts=prompt_chunk,
+                    start_index=start_index,
+                    max_length=max_length,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    top_p=top_p,
+                    request_kwargs=kwargs,
+                )
+                batch_id = self._submit_openai_batch(
+                    requests=batch_requests,
+                    completion_window=completion_window,
+                )
+                batch = self._wait_openai_batch(
+                    batch_id=batch_id,
+                    poll_interval_seconds=poll_interval,
+                    timeout_seconds=timeout,
+                )
+                output_file_id = getattr(batch, "output_file_id", None)
+                if not output_file_id:
+                    raise RuntimeError(f"OpenAI batch {batch_id} completed without output_file_id")
+                parsed = self._parse_openai_batch_output(
+                    self._download_openai_output(output_file_id)
+                )
+                for idx, text in parsed.items():
+                    if 0 <= idx < len(responses):
+                        responses[idx] = text
+            return responses
+        except Exception as exc:
+            self.logger.warning("OpenAI batch API failed; falling back to sequential calls: %s", exc)
+            return super().generate_batch(
+                prompts,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+                **kwargs,
+            )
             
     def get_logits(self, input_text: str) -> torch.Tensor:
         """OpenAI API doesn't provide logits access."""
@@ -1158,14 +1404,20 @@ class OpenAIWrapper(LLMWrapper):
         
     def tokenize(self, text: str) -> List[int]:
         """Tokenize text using tiktoken."""
+        if self.tokenizer is None:
+            return [ord(ch) for ch in text]
         return self.tokenizer.encode(text)
         
     def detokenize(self, token_ids: List[int]) -> str:
         """Detokenize using tiktoken."""
+        if self.tokenizer is None:
+            return " ".join(str(token_id) for token_id in token_ids)
         return self.tokenizer.decode(token_ids)
         
     def get_vocab_size(self) -> int:
         """Get vocabulary size (approximate for tiktoken)."""
+        if self.tokenizer is None:
+            return 0
         return self.tokenizer.n_vocab
         
     def get_model_metadata(self) -> Dict[str, Any]:
@@ -1176,6 +1428,446 @@ class OpenAIWrapper(LLMWrapper):
             "vocab_size": self.get_vocab_size(),
             "device": "api",
             "provider": "openai"
+        }
+
+
+class GeminiWrapper(LLMWrapper):
+    """Wrapper for Google Gemini API models, including batch mode."""
+
+    def __init__(
+        self,
+        model_name: str,
+        api_key: Optional[str] = None,
+        device: str = "cpu",  # API models don't use local device
+        api_base: str = "https://generativelanguage.googleapis.com/v1beta",
+        batch_poll_interval_seconds: float = 10.0,
+        batch_timeout_seconds: Optional[float] = None,
+        batch_max_requests: int = 512,
+        batch_max_payload_bytes: int = 18 * 1024 * 1024,
+        prefer_batch_api: bool = True,
+    ):
+        super().__init__(model_name, device)
+        self.api_key = (
+            api_key
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+            or os.getenv("APIKEY_GOOGLE")
+        )
+        if not self.api_key:
+            raise ValueError("Gemini API key required. Set GEMINI_API_KEY or GOOGLE_API_KEY.")
+
+        self.api_base = api_base.rstrip("/")
+        self.batch_poll_interval_seconds = max(0.1, float(batch_poll_interval_seconds))
+        self.batch_timeout_seconds = batch_timeout_seconds
+        self.batch_max_requests = max(1, int(batch_max_requests))
+        self.batch_max_payload_bytes = max(1024, int(batch_max_payload_bytes))
+        self.prefer_batch_api = bool(prefer_batch_api)
+
+        # Gemini does not expose a tokenizer via REST; use tiktoken best-effort.
+        try:
+            import tiktoken
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            self.tokenizer = None
+
+    def _http_json(
+        self,
+        method: str,
+        url: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: float = 600.0,
+    ) -> Dict[str, Any]:
+        data: Optional[bytes] = None
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        req = urlrequest.Request(url, data=data, headers=headers, method=method.upper())
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+            if not body.strip():
+                return {}
+            return json.loads(body)
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                detail = str(exc)
+            raise RuntimeError(f"Gemini HTTP {exc.code}: {detail[:300]}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Gemini network error: {exc}") from exc
+
+    @staticmethod
+    def _extract_gemini_text(response_obj: Dict[str, Any]) -> str:
+        if not isinstance(response_obj, dict):
+            return ""
+        if isinstance(response_obj.get("text"), str):
+            return response_obj["text"].strip()
+        candidates = response_obj.get("candidates", [])
+        if not candidates:
+            return ""
+        parts = candidates[0].get("content", {}).get("parts", [])
+        texts: List[str] = []
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+        return "\n".join(texts).strip()
+
+    @staticmethod
+    def _parse_gemini_state(info: Dict[str, Any]) -> Optional[str]:
+        meta = info.get("metadata")
+        if isinstance(meta, dict):
+            state = meta.get("state")
+            if isinstance(state, str):
+                return state
+            if isinstance(state, dict):
+                for key in ("name", "state", "code"):
+                    value = state.get(key)
+                    if isinstance(value, str):
+                        return value
+        state = info.get("state")
+        if isinstance(state, str):
+            return state
+        if isinstance(state, dict):
+            for key in ("name", "state", "code"):
+                value = state.get(key)
+                if isinstance(value, str):
+                    return value
+        return None
+
+    def _build_gemini_generation_config(
+        self,
+        max_length: int,
+        temperature: float,
+        do_sample: bool,
+        top_p: float,
+    ) -> Dict[str, Any]:
+        if do_sample:
+            temp = float(temperature)
+            top_p_value = float(top_p)
+        else:
+            temp = 0.0
+            top_p_value = 1.0
+        return {
+            "maxOutputTokens": int(max_length),
+            "temperature": temp,
+            "topP": top_p_value,
+        }
+
+    def _build_gemini_inline_request(
+        self,
+        prompt: str,
+        key: int,
+        max_length: int,
+        temperature: float,
+        do_sample: bool,
+        top_p: float,
+        request_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        request_payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": self._build_gemini_generation_config(
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+            ),
+        }
+        request_payload.update(request_kwargs)
+        return {
+            "request": request_payload,
+            "metadata": {"key": str(key)},
+        }
+
+    def _iter_gemini_request_chunks(
+        self,
+        prompts: List[str],
+        max_requests: int,
+        max_payload_bytes: int,
+        max_length: int,
+        temperature: float,
+        do_sample: bool,
+        top_p: float,
+        request_kwargs: Dict[str, Any],
+    ) -> List[List[Dict[str, Any]]]:
+        chunks: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_size = 0
+
+        for idx, prompt in enumerate(prompts):
+            request_obj = self._build_gemini_inline_request(
+                prompt=prompt,
+                key=idx,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+                request_kwargs=request_kwargs,
+            )
+            request_size = len(json.dumps(request_obj, ensure_ascii=False).encode("utf-8"))
+            if request_size >= max_payload_bytes:
+                raise ValueError(f"Single prompt payload exceeds Gemini batch limit (idx={idx})")
+
+            would_exceed_count = len(current) >= max_requests
+            would_exceed_size = current and (current_size + request_size > max_payload_bytes)
+            if would_exceed_count or would_exceed_size:
+                chunks.append(current)
+                current = []
+                current_size = 0
+
+            current.append(request_obj)
+            current_size += request_size
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _submit_gemini_batch(self, requests: List[Dict[str, Any]]) -> str:
+        payload = {
+            "batch": {
+                "display_name": f"reptrace-{self.model_name}-{int(time.time())}",
+                "input_config": {"requests": {"requests": requests}},
+            }
+        }
+        url = f"{self.api_base}/models/{self.model_name}:batchGenerateContent"
+        response = self._http_json("POST", url, payload=payload)
+        name = response.get("name")
+        if not name and isinstance(response.get("batch"), dict):
+            name = response["batch"].get("name")
+        if not name and isinstance(response.get("operation"), dict):
+            name = response["operation"].get("name")
+        if not isinstance(name, str):
+            raise RuntimeError(f"Gemini batch create returned unexpected payload: {response}")
+        self.logger.info("Gemini batch submitted: %s size=%d", name, len(requests))
+        return name
+
+    def _cancel_gemini_batch(self, batch_name: str) -> None:
+        url = f"{self.api_base}/{batch_name}:cancel"
+        try:
+            self._http_json("POST", url, payload={})
+        except Exception:
+            pass
+
+    def _wait_gemini_batch(
+        self,
+        batch_name: str,
+        poll_interval_seconds: float,
+        timeout_seconds: Optional[float],
+    ) -> Dict[str, Any]:
+        started = time.time()
+        last_state: Optional[str] = None
+        while True:
+            info = self._http_json("GET", f"{self.api_base}/{batch_name}", payload=None)
+            state = self._parse_gemini_state(info)
+            if state != last_state:
+                self.logger.info("Gemini batch %s state=%s", batch_name, state)
+                last_state = state
+            done = bool(info.get("done"))
+            if done or state == "JOB_STATE_SUCCEEDED":
+                return info
+            if state in {"JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}:
+                raise RuntimeError(f"Gemini batch {batch_name} failed with state={state}")
+
+            if timeout_seconds is not None and (time.time() - started) > timeout_seconds:
+                self._cancel_gemini_batch(batch_name)
+                raise TimeoutError(f"Gemini batch {batch_name} timed out after {timeout_seconds}s")
+            time.sleep(max(0.1, poll_interval_seconds))
+
+    def _download_gemini_result_file(self, file_name: str) -> str:
+        base = self.api_base
+        if "/v1beta" in base:
+            base = base.split("/v1beta")[0] + "/download/v1beta"
+        else:
+            base = "https://generativelanguage.googleapis.com/download/v1beta"
+        url = f"{base}/{file_name}:download?alt=media"
+        req = urlrequest.Request(
+            url,
+            headers={"x-goog-api-key": self.api_key},
+            method="GET",
+        )
+        with urlrequest.urlopen(req, timeout=600) as response:
+            return response.read().decode("utf-8", errors="replace")
+
+    def _parse_gemini_batch_response(self, info: Dict[str, Any]) -> Dict[int, str]:
+        output: Dict[int, str] = {}
+        response = info.get("response", {})
+        if not isinstance(response, dict):
+            return output
+
+        inlined = response.get("inlinedResponses")
+        if isinstance(inlined, dict):
+            inlined = inlined.get("inlinedResponses", [])
+        if isinstance(inlined, list):
+            for item in inlined:
+                if not isinstance(item, dict):
+                    continue
+                key_value = None
+                if isinstance(item.get("metadata"), dict):
+                    key_value = item["metadata"].get("key")
+                if key_value is None:
+                    key_value = item.get("key")
+                if key_value is None:
+                    continue
+                try:
+                    key = int(str(key_value))
+                except ValueError:
+                    continue
+                resp_obj = item.get("response") or item.get("inlineResponse") or {}
+                output[key] = self._extract_gemini_text(resp_obj)
+            if output:
+                return output
+
+        responses_file = response.get("responsesFile")
+        if isinstance(responses_file, str):
+            raw_lines = self._download_gemini_result_file(responses_file).splitlines()
+            for line in raw_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key_value = item.get("key")
+                if key_value is None and isinstance(item.get("metadata"), dict):
+                    key_value = item["metadata"].get("key")
+                if key_value is None:
+                    continue
+                try:
+                    key = int(str(key_value))
+                except ValueError:
+                    continue
+                resp_obj = item.get("response") or item.get("inlineResponse") or {}
+                output[key] = self._extract_gemini_text(resp_obj)
+        return output
+
+    def generate(
+        self,
+        input_text: str,
+        max_length: int = 1024,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> str:
+        kwargs.pop("skip_chat_template", None)
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": input_text}]}],
+            "generationConfig": self._build_gemini_generation_config(
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+            ),
+            **kwargs,
+        }
+        try:
+            response = self._http_json(
+                method="POST",
+                url=f"{self.api_base}/models/{self.model_name}:generateContent",
+                payload=payload,
+            )
+            return self._extract_gemini_text(response)
+        except Exception as exc:
+            self.logger.error("Gemini API error: %s", exc)
+            return ""
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_length: int = 1024,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> List[str]:
+        if not prompts:
+            return []
+
+        prefer_batch_api = bool(kwargs.pop("prefer_batch_api", self.prefer_batch_api))
+        max_requests = int(kwargs.pop("batch_max_requests", self.batch_max_requests))
+        max_payload_bytes = int(kwargs.pop("batch_max_payload_bytes", self.batch_max_payload_bytes))
+        poll_interval = float(kwargs.pop("batch_poll_interval_seconds", self.batch_poll_interval_seconds))
+        timeout = kwargs.pop("batch_timeout_seconds", self.batch_timeout_seconds)
+
+        # Wrapper-only kwarg
+        kwargs.pop("skip_chat_template", None)
+
+        if not prefer_batch_api:
+            return super().generate_batch(
+                prompts,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+                **kwargs,
+            )
+
+        responses: List[str] = [""] * len(prompts)
+        try:
+            request_chunks = self._iter_gemini_request_chunks(
+                prompts=prompts,
+                max_requests=max(1, max_requests),
+                max_payload_bytes=max_payload_bytes,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+                request_kwargs=kwargs,
+            )
+            for request_chunk in request_chunks:
+                batch_name = self._submit_gemini_batch(request_chunk)
+                info = self._wait_gemini_batch(
+                    batch_name=batch_name,
+                    poll_interval_seconds=poll_interval,
+                    timeout_seconds=timeout,
+                )
+                parsed = self._parse_gemini_batch_response(info)
+                for idx, text in parsed.items():
+                    if 0 <= idx < len(responses):
+                        responses[idx] = text
+            return responses
+        except Exception as exc:
+            self.logger.warning("Gemini batch API failed; falling back to sequential calls: %s", exc)
+            return super().generate_batch(
+                prompts,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+                **kwargs,
+            )
+
+    def get_logits(self, input_text: str) -> torch.Tensor:
+        raise NotImplementedError("Gemini API models don't provide logits access")
+
+    def tokenize(self, text: str) -> List[int]:
+        if self.tokenizer is None:
+            return [ord(ch) for ch in text]
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids: List[int]) -> str:
+        if self.tokenizer is None:
+            return " ".join(str(token_id) for token_id in token_ids)
+        return self.tokenizer.decode(token_ids)
+
+    def get_vocab_size(self) -> int:
+        if self.tokenizer is None:
+            return 0
+        return self.tokenizer.n_vocab
+
+    def get_model_metadata(self) -> Dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "model_type": "gemini_api",
+            "vocab_size": self.get_vocab_size(),
+            "device": "api",
+            "provider": "google",
         }
 
 

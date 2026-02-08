@@ -86,7 +86,7 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--model-type",
         type=str,
         default="auto",
-        choices=["auto", "huggingface", "openai", "anthropic"],
+        choices=["auto", "huggingface", "openai", "gemini"],
     )
 
     # Dataset and probes

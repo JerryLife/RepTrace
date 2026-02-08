@@ -9,7 +9,7 @@ __all__ = [
     "calc_dna_batch",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1b1"
 
 
 def __getattr__(name: str):
