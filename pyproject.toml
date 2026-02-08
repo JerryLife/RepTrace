@@ -19,8 +19,9 @@ classifiers = [
 
 dependencies = [
     "numpy>=1.24.0",
-    "torch>=2.0.0",
+    "torch>=2.4.0",
     "transformers>=4.40.0",
+    "accelerate>=0.26.0",
     "huggingface-hub>=0.23.0",
     "datasets>=2.14.0",
     "pandas>=2.0.0",
@@ -41,6 +42,7 @@ dev = [
 
 [project.scripts]
 reptrace = "reptrace.cli:main"
+calc-dna = "reptrace.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -49,6 +51,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build]
 include = [
     "scripts/calc_dna.sh",
+    "scripts/calc_dna.py",
     "configs/llm_list.txt",
     "README.md",
     "LICENSE",

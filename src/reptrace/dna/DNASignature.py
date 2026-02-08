@@ -58,6 +58,10 @@ class DNASignature:
         if len(self.signature.shape) != 1:
             raise ValueError(f"DNA signature must be 1D, got shape {self.signature.shape}")
         
+        # Fail-fast for empty signatures
+        if self.signature.size == 0:
+            raise ValueError("Empty DNA signature detected. DNA extraction failed.")
+        
         if len(self.signature) != metadata.dna_dimension:
             self.logger.warning(
                 f"Signature length {len(self.signature)} != metadata dimension {metadata.dna_dimension}"
@@ -347,57 +351,6 @@ class DNASignature:
         
         return cls(signature, metadata)
 
-    def to_cgta_dna(self, *, min_value: float, max_value: float, bp_per_value: int) -> str:
-        """
-        Map the numeric signature vector to a DNA sequence using CGTA quantization.
-
-        Each float value is quantized into one of 4 bins over the closed interval
-        [min_value, max_value] and mapped to a nucleotide in the fixed order:
-        C < G < T < A. The parameter bp_per_value controls how many bases are
-        emitted per single vector value (i.e., run-length per bin).
-
-        Args:
-            min_value: Minimum value for quantization range (required).
-            max_value: Maximum value for quantization range (required).
-            bp_per_value: Positive integer length of DNA emitted per vector value (required).
-
-        Returns:
-            A DNA sequence string over the alphabet {C,G,T,A}.
-
-        Raises:
-            ValueError: If parameters are missing/invalid or range is degenerate.
-        """
-        if min_value is None or max_value is None or bp_per_value is None:
-            raise ValueError("min_value, max_value, and bp_per_value are all required")
-        try:
-            min_v = float(min_value)
-            max_v = float(max_value)
-        except Exception:
-            raise ValueError("min_value and max_value must be numeric")
-        if not isinstance(bp_per_value, int) or bp_per_value < 1:
-            raise ValueError("bp_per_value must be a positive integer")
-        if not np.isfinite(min_v) or not np.isfinite(max_v):
-            raise ValueError("min_value and max_value must be finite numbers")
-        if max_v <= min_v:
-            raise ValueError("max_value must be greater than min_value")
-
-        # Clamp to [min_v, max_v]
-        vals = np.clip(self.signature.astype(np.float32), min_v, max_v)
-        # Normalize to [0,1]
-        norm = (vals - min_v) / (max_v - min_v)
-        # Map to bins 0..3; ensure right edge maps to 3
-        bins = np.floor(norm * 4.0).astype(np.int32)
-        bins = np.clip(bins, 0, 3)
-        # Map bins to bases in CGTA order
-        lut = np.array(list("CGTA"))  # 0->C, 1->G, 2->T, 3->A
-        bases = lut[bins]
-
-        if bp_per_value == 1:
-            return "".join(bases.tolist())
-        # Repeat each base bp_per_value times
-        repeated = np.repeat(bases, bp_per_value)
-        return "".join(repeated.tolist())
-    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
         return {

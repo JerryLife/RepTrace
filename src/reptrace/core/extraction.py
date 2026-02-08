@@ -13,8 +13,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-import pickle
-import fcntl
 import json
 import re
 from transformers import AutoTokenizer
@@ -123,24 +121,11 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Dimensionality reduction method (for embedding DNA)"
     )
 
-    # Generation arguments
     parser.add_argument(
         "--max-length",
         type=int,
         default=1024,
         help="Maximum sequence length for generation"
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.7,
-        help="Generation temperature"
-    )
-    parser.add_argument(
-        "--top-p",
-        type=float,
-        default=0.9,
-        help="Top-p (nucleus) sampling parameter"
     )
     
     # Output arguments
@@ -260,79 +245,54 @@ def _safe_dataset_key(ds_id: str) -> str:
 
 def _dataset_cache_path(dataset_id: str, max_samples: int, random_seed: int) -> Path:
     safe = _safe_dataset_key(dataset_id)
-    filename = f"dataset_{safe}_n{int(max_samples)}_seed{int(random_seed)}.pkl"
+    filename = f"dataset_{safe}_n{int(max_samples)}_seed{int(random_seed)}.json"
     return _get_cache_dir() / filename
 
 
 def _load_cached_dataset(dataset_id: str, max_samples: int, random_seed: int) -> Optional[List[str]]:
-    """Load cached probe texts with lock protection."""
+    """Load cached probe texts from JSON file."""
     path = _dataset_cache_path(dataset_id, max_samples, random_seed)
     if not path.exists():
         return None
-    lock_path = path.with_suffix('.lock')
     try:
-        with open(lock_path, 'w') as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
-            if path.exists():
-                with open(path, 'rb') as f:
-                    data = pickle.load(f)
-                # Basic integrity check
-                if (
-                    isinstance(data, dict)
-                    and data.get('dataset_id') == dataset_id
-                    and int(data.get('max_samples', -1)) == int(max_samples)
-                    and int(data.get('random_seed', -1)) == int(random_seed)
-                    and isinstance(data.get('probe_texts'), list)
-                ):
-                    logging.info(f"Loaded cached dataset samples from {path}")
-                    return data['probe_texts']
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # Basic integrity check
+        if (
+            isinstance(data, dict)
+            and data.get('dataset_id') == dataset_id
+            and int(data.get('max_samples', -1)) == int(max_samples)
+            and int(data.get('random_seed', -1)) == int(random_seed)
+            and isinstance(data.get('probe_texts'), list)
+        ):
+            logging.info(f"Loaded cached dataset samples from {path}")
+            return data['probe_texts']
     except Exception as e:
         logging.warning(f"Failed to load dataset cache {path}: {e}")
-    finally:
-        try:
-            if lock_path.exists():
-                lock_path.unlink()
-        except Exception:
-            pass
     return None
 
 
 def _save_cached_dataset(dataset_id: str, max_samples: int, random_seed: int, probe_texts: List[str]) -> None:
-    """Save probe texts to cache with lock + atomic rename."""
+    """Save probe texts to cache as JSON for visibility."""
     path = _dataset_cache_path(dataset_id, max_samples, random_seed)
-    lock_path = path.with_suffix('.lock')
-    tmp_path = path.with_suffix('.tmp')
+    if path.exists():
+        return  # Already cached
+    
     payload = {
         'dataset_id': dataset_id,
         'max_samples': int(max_samples),
         'random_seed': int(random_seed),
         'count': int(len(probe_texts)),
         'probe_texts': probe_texts,
-        'timestamp': time.time(),
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
     }
     try:
-        with open(lock_path, 'w') as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            # If another process wrote it while waiting, do not overwrite
-            if path.exists():
-                return
-            with open(tmp_path, 'wb') as f:
-                pickle.dump(payload, f)
-            tmp_path.rename(path)
-            logging.info(f"Saved dataset cache to {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        logging.info(f"Saved dataset cache to {path}")
     except Exception as e:
         logging.warning(f"Failed to save dataset cache {path}: {e}")
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except Exception:
-            pass
-    finally:
-        try:
-            if lock_path.exists():
-                lock_path.unlink()
-        except Exception:
-            pass
 
 
 def get_probe_texts(
@@ -422,13 +382,11 @@ def extract_dna_signature(
     args: argparse.Namespace
 ) -> DNASignature:
     """Extract DNA signature from model."""
-    
-    # Apply Chat Template if needed for embedding extraction
-    # Only apply if not skipping chat templates
-    if (extractor_type == "embedding" and 
-        model_metadata.get('chat_model', {}).get('is_chat_model', False) and
-        not args.skip_chat_template):
-        logging.info("Chat model detected. Applying chat template to probe texts.")
+
+    # Apply chat template when available for chat-oriented tokenizers.
+    if extractor_type == "embedding" and not args.skip_chat_template:
+        is_chat_model = model_metadata.get("chat_model", {}).get("is_chat_model", False)
+        should_try_template = is_chat_model or "chat_model" not in model_metadata
         try:
             # Prefer new 'token' kw; fallback to 'use_auth_token' for older Transformers
             tokenizer_kwargs = {"trust_remote_code": args.trust_remote_code}
@@ -448,19 +406,20 @@ def extract_dna_signature(
                     model_path or model_name,
                     **fallback_kwargs
                 )
-            formatted_probes = []
-            for text in probe_texts:
-                chat_message = [{"role": "user", "content": text}]
-                formatted_prompt = tokenizer.apply_chat_template(
-                    chat_message, tokenize=False, add_generation_prompt=True
-                )
-                formatted_probes.append(formatted_prompt)
-            probe_texts = formatted_probes # Replace raw text with formatted prompts
+
+            tokenizer_has_chat_template = bool(getattr(tokenizer, "chat_template", None))
+            if should_try_template and tokenizer_has_chat_template:
+                logging.info("Applying tokenizer chat template to probe texts.")
+                formatted_probes = []
+                for text in probe_texts:
+                    chat_message = [{"role": "user", "content": text}]
+                    formatted_prompt = tokenizer.apply_chat_template(
+                        chat_message, tokenize=False, add_generation_prompt=True
+                    )
+                    formatted_probes.append(formatted_prompt)
+                probe_texts = formatted_probes  # Replace raw text with formatted prompts
         except Exception as e:
-            logging.error(f"Failed to apply chat template: {e}")
-            # Decide if you want to proceed with raw text or exit
-            # For now, we'll proceed with a warning
-            logging.warning("Proceeding with raw probe texts.")
+            logging.warning(f"Failed to apply chat template: {e}. Proceeding with raw probes.")
     
     # Load model with quantization settings
     logging.info(f"Loading model: {model_name}")
@@ -514,8 +473,6 @@ def extract_dna_signature(
         probe_inputs=probe_texts,
         probe_set_id=f"{args.dataset}_{len(probe_texts)}",
         max_length=args.max_length,
-        temperature=args.temperature,
-        top_p=args.top_p
     )
     
     return signature
@@ -571,13 +528,22 @@ def main():
     # Setup logging
     setup_logging(level=args.log_level)
     
-    # Load metadata and get info for the current model
+    # Load metadata and get info for the current model.
     all_metadata = load_model_metadata(args.metadata_file)
-    model_meta = all_metadata.get(args.model_name)
-
-    if not model_meta:
-        logging.error(f"Metadata for '{args.model_name}' not found in {args.metadata_file}. Cannot proceed.")
-        return 1
+    model_meta = all_metadata.get(
+        args.model_name,
+        {
+            "model_name": args.model_name,
+            "architecture": {"is_generative": True},
+            "repository": {},
+        },
+    )
+    if args.model_name not in all_metadata:
+        logging.info(
+            "Metadata for '%s' not found in %s. Proceeding with runtime defaults.",
+            args.model_name,
+            args.metadata_file,
+        )
     
     # If model_path is not provided but metadata has a local_path, use it
     # This allows using short names in list files while still loading from full paths
@@ -592,7 +558,7 @@ def main():
             logging.info(f"Using model_id as local path: {args.model_path}")
 
     # Early exit for non-generative models based on metadata
-    if not model_meta.get('architecture', {}).get('is_generative', False):
+    if model_meta.get('architecture', {}).get('is_generative') is False:
         arch_type = model_meta.get('architecture', {}).get('type')
         logging.warning(
             f"Skipping model '{args.model_name}' (architecture: {arch_type}). "

@@ -1,6 +1,12 @@
-from reptrace.experiments import compute_dna
+from reptrace import DNAExtractionConfig
+from reptrace.calc_dna import parse_arguments
 
 
 def test_default_dataset_is_rand():
-    args = compute_dna.parse_arguments([])
+    args = parse_arguments(["--model-name", "distilgpt2"])
     assert args.dataset == "rand"
+
+
+def test_public_api_defaults_are_stable():
+    config = DNAExtractionConfig(model_name="distilgpt2")
+    assert config.dataset == "rand"

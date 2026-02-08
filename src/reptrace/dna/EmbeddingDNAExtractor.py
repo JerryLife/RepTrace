@@ -219,23 +219,7 @@ class EmbeddingDNAExtractor(InferenceExtractor):
             )
         
         if not filtered_probes:
-            self.logger.error("No valid probes left after filtering. Cannot extract DNA.")
-            # Return a dummy DNASignature to avoid crashing
-            error_metadata = DNAMetadata(
-                model_name=model.model_name,
-                extraction_method=f"embedding_{self.reduction_method}_{self.aggregation_method}",
-                probe_set_id=probe_set_id,
-                probe_count=0,
-                dna_dimension=self.dna_dim,
-                embedding_dimension=0,  # No embeddings extracted
-                reduction_method=self.reduction_method,
-                extraction_time=datetime.now().isoformat(),
-                computation_time_seconds=0.0,
-                model_metadata={},
-                extractor_config={},
-                aggregation_method=self.aggregation_method
-            )
-            return DNASignature(np.array([]), error_metadata)
+            raise ValueError("No valid probes left after filtering. Cannot extract DNA.")
         
         # Use the filtered list from now on
         probe_inputs = filtered_probes
@@ -263,22 +247,7 @@ class EmbeddingDNAExtractor(InferenceExtractor):
                 raise ValueError("Feature extraction resulted in zero valid vectors.")
                 
         except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError) as e:
-            self.logger.error(f"Critical error during feature extraction: {e}. Aborting DNA extraction for this model.")
-            error_metadata = DNAMetadata(
-                model_name=model.model_name,
-                extraction_method=f"embedding_hidden_state_{self.reduction_method}_{self.aggregation_method}",
-                probe_set_id=probe_set_id,
-                probe_count=len(probe_inputs),
-                dna_dimension=self.dna_dim,
-                embedding_dimension=0,  # Error occurred before extraction
-                reduction_method=self.reduction_method,
-                extraction_time=datetime.now().isoformat(),
-                computation_time_seconds=0.0,
-                model_metadata={},
-                extractor_config={},
-                aggregation_method=self.aggregation_method
-            )
-            return DNASignature(np.array([]), error_metadata)
+            raise RuntimeError(f"Critical error during feature extraction for {model.model_name}: {e}") from e
         
         # Apply dimensionality reduction (stateless - creates fresh reducer each time)
         dna_vector = self._reduce_features(feature_vectors)
@@ -579,9 +548,14 @@ class EmbeddingDNAExtractor(InferenceExtractor):
         elif self.aggregation_method == "max":
             aggregated_dna = reduced_features.max(axis=0)
         elif self.aggregation_method == "concat":
-            # Use max aggregation instead of arbitrary truncation for better robustness
-            aggregated_dna = reduced_features.max(axis=0)
-            self.logger.info("Using max aggregation for concat method (more robust than truncation)")
+            # Flatten all reduced features into a single vector
+            aggregated_dna = reduced_features.flatten()
+            # Truncate or pad to match target dna_dim
+            if len(aggregated_dna) > self.dna_dim:
+                aggregated_dna = aggregated_dna[:self.dna_dim]
+            elif len(aggregated_dna) < self.dna_dim:
+                padding = np.zeros(self.dna_dim - len(aggregated_dna))
+                aggregated_dna = np.concatenate([aggregated_dna, padding])
         else:
             raise ValueError(f"Unsupported aggregation method: {self.aggregation_method}")
         
@@ -590,14 +564,14 @@ class EmbeddingDNAExtractor(InferenceExtractor):
             self.logger.warning("Found NaN or infinite values in aggregated DNA. Cleaning...")
             aggregated_dna = np.nan_to_num(aggregated_dna, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Ensure we have the correct output dimension
-        if len(aggregated_dna) < self.dna_dim:
-            # Pad with zeros if needed
-            padding = np.zeros(self.dna_dim - len(aggregated_dna))
-            aggregated_dna = np.concatenate([aggregated_dna, padding])
-        elif len(aggregated_dna) > self.dna_dim:
-            # This should not happen with proper max_components calculation
-            aggregated_dna = aggregated_dna[:self.dna_dim]
+        # Ensure we have the correct output dimension (only for non-concat methods)
+        if self.aggregation_method != "concat":
+            if len(aggregated_dna) < self.dna_dim:
+                # Pad with zeros if needed
+                padding = np.zeros(self.dna_dim - len(aggregated_dna))
+                aggregated_dna = np.concatenate([aggregated_dna, padding])
+            elif len(aggregated_dna) > self.dna_dim:
+                aggregated_dna = aggregated_dna[:self.dna_dim]
             
         return aggregated_dna
         
