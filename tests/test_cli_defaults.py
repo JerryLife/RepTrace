@@ -1,5 +1,5 @@
 from reptrace import DNAExtractionConfig
-from reptrace.calc_dna import parse_arguments
+from reptrace.cli import parse_arguments
 
 
 def test_default_dataset_is_rand():

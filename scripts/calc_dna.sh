@@ -12,4 +12,4 @@ fi
 
 export PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-exec "$PYTHON_BIN" "$SCRIPT_DIR/calc_dna.py" "$@"
+exec "$PYTHON_BIN" "$PROJECT_ROOT/scripts/calc_dna.py" "$@"
