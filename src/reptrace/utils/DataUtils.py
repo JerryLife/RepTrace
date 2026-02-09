@@ -13,6 +13,26 @@ import numpy as np
 import pandas as pd
 
 
+class _HttpxInfoToDebugFilter(logging.Filter):
+    """Downgrade noisy httpx request INFO lines to DEBUG."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name.startswith("httpx") and record.levelno == logging.INFO:
+            message = record.getMessage()
+            if message.startswith("HTTP Request:"):
+                record.levelno = logging.DEBUG
+                record.levelname = "DEBUG"
+        return True
+
+
+def _resolve_log_level(level: Union[int, str]) -> int:
+    if isinstance(level, int):
+        return level
+    if isinstance(level, str):
+        return logging._nameToLevel.get(level.upper(), logging.INFO)
+    return logging.INFO
+
+
 def get_cache_dir(env_var: str = "REPTRACE_CACHE_DIR", default_dir: str = "cache") -> Path:
     """
     Resolve a writable cache directory.
@@ -44,6 +64,8 @@ def setup_logging(
     if format_string is None:
         format_string = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     
+    resolved_level = _resolve_log_level(level)
+
     # Configure basic logging
     handlers = [logging.StreamHandler()]
     
@@ -51,7 +73,7 @@ def setup_logging(
         handlers.append(logging.FileHandler(log_file))
     
     logging.basicConfig(
-        level=level,
+        level=resolved_level,
         format=format_string,
         handlers=handlers,
         force=True
@@ -61,6 +83,18 @@ def setup_logging(
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("datasets").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # httpx request lines are too noisy at INFO for API-heavy runs.
+    # Keep them visible only in DEBUG mode and relabel them as DEBUG.
+    httpx_logger = logging.getLogger("httpx")
+    if resolved_level <= logging.DEBUG:
+        httpx_logger.setLevel(logging.DEBUG)
+        httpx_filter = _HttpxInfoToDebugFilter()
+        for handler in logging.getLogger().handlers:
+            handler.addFilter(httpx_filter)
+    else:
+        httpx_logger.setLevel(logging.WARNING)
 
 
 def load_config(config_path: Union[str, Path]) -> Dict[str, Any]:

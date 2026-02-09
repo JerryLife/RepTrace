@@ -263,6 +263,27 @@ def _resolve_generation_devices(
     return [core.validate_device_argument(config.device)]
 
 
+def _is_api_model_type(model_type: str) -> bool:
+    return model_type in {"openai", "openrouter", "gemini", "anthropic"}
+
+
+def _is_api_parallel_mode(config: DNAExtractionConfig, model_names: list[str]) -> bool:
+    if _is_api_model_type(config.model_type):
+        return True
+    if config.model_type != "auto":
+        return False
+
+    try:
+        from .models.ModelLoader import ModelLoader
+
+        loader = ModelLoader()
+        detected_types = [loader._detect_model_type(name) for name in model_names]
+        return bool(detected_types) and all(_is_api_model_type(model_type) for model_type in detected_types)
+    except Exception as exc:
+        logging.debug("Failed to infer API parallel mode from model names: %s", exc)
+        return False
+
+
 def _response_cache_path(config: DNAExtractionConfig, model_name: str) -> Path:
     safe_model_name = model_name.replace("/", "_").replace(":", "_")
     dataset_identifier = config.dataset.replace(",", "_")
@@ -298,16 +319,20 @@ def _load_cached_responses(path: Path, expected_count: int) -> Optional[list[str
         logging.warning("Unexpected cached response format at %s", path)
         return None
 
+    if not responses:
+        return None
+
     if len(responses) != expected_count:
         logging.warning(
-            "Ignoring cached responses at %s due to probe count mismatch (%s != %s).",
+            "Cached responses at %s have probe count mismatch (%s != %s); normalizing by truncating/padding.",
             path,
             len(responses),
             expected_count,
         )
-        return None
+    else:
+        logging.info("Loaded cached responses from %s (%d items).", path, len(responses))
 
-    return responses
+    return _normalize_responses(responses, expected_count=expected_count)
 
 
 def _save_response_cache(
@@ -337,6 +362,7 @@ def _generate_responses_for_model(
     probe_texts: list[str],
     device: str,
     resolved_token: Optional[str],
+    incremental_save_path: Optional[Path] = None,
 ) -> list[str]:
     from .models.ModelLoader import ModelLoader
 
@@ -361,6 +387,24 @@ def _generate_responses_for_model(
         is_chat_model=model_meta.get("chat_model", {}).get("is_chat_model", False),
     )
 
+    # Set up incremental saving callback
+    incremental_items: list[dict] = []
+    def _save_response_incrementally(idx: int, prompt: str, response: str) -> None:
+        """Callback to save each response as it's generated."""
+        incremental_items.append({"prompt": prompt, "response": response})
+        if incremental_save_path is not None:
+            incremental_save_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "model": model_name,
+                "dataset": config.dataset,
+                "count": len(incremental_items),
+                "complete": len(incremental_items) >= len(probe_texts),
+                "items": incremental_items,
+                "generated_at": datetime.now().isoformat(),
+            }
+            with open(incremental_save_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+
     try:
         if hasattr(model, "generate_batch") and callable(getattr(model, "generate_batch")):
             responses = model.generate_batch(
@@ -370,20 +414,22 @@ def _generate_responses_for_model(
                 do_sample=False,
                 top_p=1.0,
                 skip_chat_template=config.skip_chat_template,
+                on_response_callback=_save_response_incrementally if incremental_save_path else None,
             )
         else:
             responses = []
-            for prompt in probe_texts:
-                responses.append(
-                    model.generate(
-                        prompt,
-                        max_length=config.max_length,
-                        temperature=0.0,
-                        do_sample=False,
-                        top_p=1.0,
-                        skip_chat_template=config.skip_chat_template,
-                    )
+            for idx, prompt in enumerate(probe_texts):
+                response = model.generate(
+                    prompt,
+                    max_length=config.max_length,
+                    temperature=0.0,
+                    do_sample=False,
+                    top_p=1.0,
+                    skip_chat_template=config.skip_chat_template,
                 )
+                responses.append(response)
+                if incremental_save_path:
+                    _save_response_incrementally(idx, prompt, response)
     finally:
         try:
             if hasattr(model, "release") and callable(getattr(model, "release")):
@@ -392,6 +438,79 @@ def _generate_responses_for_model(
             logging.debug("Failed to release model %s cleanly.", model_name)
 
     return _normalize_responses(list(responses), expected_count=len(probe_texts))
+
+
+def _extract_signature_from_text_responses(
+    model_name: str,
+    responses: list[str],
+    config: DNAExtractionConfig,
+    model_meta: Dict[str, Any],
+    generation_device: str,
+    sentence_encoder: str = "all-mpnet-base-v2",
+    encoder_device: Optional[str] = None,
+) -> tuple["DNASignature", np.ndarray, float]:
+    from .dna.DNASignature import DNAMetadata, DNASignature
+    from .dna.EmbeddingDNAExtractor import EmbeddingDNAExtractor
+    from sentence_transformers import SentenceTransformer
+
+    if not responses:
+        raise ValueError("No responses available for text-response embedding extraction.")
+
+    resolved_encoder_device = encoder_device or generation_device or "cpu"
+    logging.info(
+        "Encoding %d cached response(s) with sentence encoder '%s' on %s",
+        len(responses),
+        sentence_encoder,
+        resolved_encoder_device,
+    )
+
+    encode_started = time.time()
+    encoder = SentenceTransformer(sentence_encoder, device=resolved_encoder_device)
+    embeddings = encoder.encode(
+        responses,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        batch_size=32,
+    )
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    encode_seconds = time.time() - encode_started
+
+    reducer = EmbeddingDNAExtractor(
+        dna_dim=config.dna_dim,
+        reduction_method=config.reduction_method,
+        aggregation_method=config.embedding_merge,
+        device="cpu",
+        random_seed=config.random_seed,
+    )
+
+    reduce_started = time.time()
+    reduced_vector = reducer._reduce_features(embeddings)
+    reduce_seconds = time.time() - reduce_started
+
+    metadata = DNAMetadata(
+        model_name=model_name,
+        extraction_method=f"text_response_embeddings_{config.reduction_method}_{config.embedding_merge}",
+        probe_set_id=f"{config.dataset}_{len(responses)}",
+        probe_count=len(responses),
+        dna_dimension=config.dna_dim,
+        embedding_dimension=int(embeddings.shape[1]) if embeddings.ndim == 2 else 0,
+        reduction_method=config.reduction_method,
+        extraction_time=datetime.now().isoformat(),
+        computation_time_seconds=encode_seconds + reduce_seconds,
+        model_metadata=model_meta,
+        extractor_config={
+            "mode": "single_cached_response_embeddings",
+            "sentence_encoder": sentence_encoder,
+            "generation_device": generation_device,
+            "encoder_device": resolved_encoder_device,
+            "max_length": config.max_length,
+            "dataset": config.dataset,
+        },
+        aggregation_method=config.embedding_merge,
+    )
+    signature = DNASignature(signature=np.asarray(reduced_vector, dtype=np.float32), metadata=metadata)
+    vector = _validate_signature(signature)
+    return signature, vector, (encode_seconds + reduce_seconds)
 
 
 def calc_dna(config: DNAExtractionConfig) -> DNAExtractionResult:
@@ -403,48 +522,10 @@ def calc_dna(config: DNAExtractionConfig) -> DNAExtractionResult:
     setup_logging(level=config.log_level)
     _validate_quantization(config)
 
+    start_time = time.time()
     metadata_file = Path(config.metadata_file) if config.metadata_file is not None else None
     resolved_device = _resolve_device(config)
     resolved_token = _resolve_hf_token(config.token)
-    model_meta = _load_model_metadata_for_model(config.model_name, metadata_file, token=resolved_token)
-
-    is_generative = model_meta.get("architecture", {}).get("is_generative")
-    if is_generative is False:
-        arch_type = model_meta.get("architecture", {}).get("type")
-        raise ValueError(
-            f"Model '{config.model_name}' is non-generative (architecture={arch_type})."
-        )
-
-    resolved_model_path = _resolve_model_path(config.model_path, model_meta)
-
-    args = SimpleNamespace(
-        model_name=config.model_name,
-        model_path=resolved_model_path,
-        model_type=config.model_type,
-        dataset=config.dataset,
-        probe_set=config.probe_set,
-        max_samples=config.max_samples,
-        data_root=config.data_root,
-        extractor_type=config.extractor_type,
-        dna_dim=config.dna_dim,
-        reduction_method=config.reduction_method,
-        embedding_merge=config.embedding_merge,
-        max_length=config.max_length,
-        save_format="json",
-        output_dir=Path(config.output_dir),
-        load_in_8bit=config.load_in_8bit,
-        load_in_4bit=config.load_in_4bit,
-        no_quantization=config.no_quantization,
-        metadata_file=metadata_file,
-        token=resolved_token,
-        trust_remote_code=config.trust_remote_code,
-        device=resolved_device,
-        log_level=config.log_level,
-        random_seed=config.random_seed,
-        skip_chat_template=config.skip_chat_template,
-    )
-
-    start_time = time.time()
     probe_texts = core.get_probe_texts(
         dataset_id=config.dataset,
         probe_set=config.probe_set,
@@ -453,17 +534,114 @@ def calc_dna(config: DNAExtractionConfig) -> DNAExtractionResult:
         random_seed=config.random_seed,
     )
 
-    signature = core.extract_dna_signature(
-        model_name=config.model_name,
-        model_path=resolved_model_path,
-        model_type=config.model_type,
-        probe_texts=probe_texts,
-        extractor_type=config.extractor_type,
-        model_metadata=model_meta,
-        args=args,
-    )
+    signature: "DNASignature"
+    vector: np.ndarray
 
-    vector = _validate_signature(signature)
+    is_api_mode = _is_api_parallel_mode(config, [config.model_name])
+    response_path = _response_cache_path(config, config.model_name)
+    cached_responses: Optional[list[str]] = None
+    if is_api_mode and config.extractor_type == "embedding":
+        cached_responses = _load_cached_responses(response_path, expected_count=len(probe_texts))
+
+    if cached_responses is not None:
+        logging.info(
+            "Using cached responses for '%s' from %s; skipping provider model/key checks.",
+            config.model_name,
+            response_path,
+        )
+        model_meta = _default_model_metadata(config.model_name)
+        signature, vector, _ = _extract_signature_from_text_responses(
+            model_name=config.model_name,
+            responses=cached_responses,
+            config=config,
+            model_meta=model_meta,
+            generation_device=resolved_device,
+            encoder_device=resolved_device,
+        )
+    elif is_api_mode and config.extractor_type == "embedding":
+        # API model without cached responses: generate via API, then encode
+        logging.info(
+            "Generating responses for API model '%s' via provider API...",
+            config.model_name,
+        )
+        model_meta = _load_model_metadata_for_model(config.model_name, metadata_file, token=resolved_token)
+        responses = _generate_responses_for_model(
+            model_name=config.model_name,
+            config=config,
+            model_meta=model_meta,
+            probe_texts=probe_texts,
+            device=resolved_device,
+            resolved_token=resolved_token,
+            incremental_save_path=response_path if config.save else None,
+        )
+        # Save final response cache
+        if config.save:
+            _save_response_cache(
+                path=response_path,
+                model_name=config.model_name,
+                dataset=config.dataset,
+                prompts=probe_texts,
+                responses=responses,
+            )
+        signature, vector, _ = _extract_signature_from_text_responses(
+            model_name=config.model_name,
+            responses=responses,
+            config=config,
+            model_meta=model_meta,
+            generation_device=resolved_device,
+            encoder_device=resolved_device,
+        )
+    else:
+        # Non-API model: use hidden-state extraction
+        model_meta = _load_model_metadata_for_model(config.model_name, metadata_file, token=resolved_token)
+
+        is_generative = model_meta.get("architecture", {}).get("is_generative")
+        if is_generative is False:
+            arch_type = model_meta.get("architecture", {}).get("type")
+            raise ValueError(
+                f"Model '{config.model_name}' is non-generative (architecture={arch_type})."
+            )
+
+        resolved_model_path = _resolve_model_path(config.model_path, model_meta)
+
+        args = SimpleNamespace(
+            model_name=config.model_name,
+            model_path=resolved_model_path,
+            model_type=config.model_type,
+            dataset=config.dataset,
+            probe_set=config.probe_set,
+            max_samples=config.max_samples,
+            data_root=config.data_root,
+            extractor_type=config.extractor_type,
+            dna_dim=config.dna_dim,
+            reduction_method=config.reduction_method,
+            embedding_merge=config.embedding_merge,
+            max_length=config.max_length,
+            save_format="json",
+            output_dir=Path(config.output_dir),
+            load_in_8bit=config.load_in_8bit,
+            load_in_4bit=config.load_in_4bit,
+            no_quantization=config.no_quantization,
+            metadata_file=metadata_file,
+            token=resolved_token,
+            trust_remote_code=config.trust_remote_code,
+            device=resolved_device,
+            log_level=config.log_level,
+            random_seed=config.random_seed,
+            skip_chat_template=config.skip_chat_template,
+        )
+
+        signature = core.extract_dna_signature(
+            model_name=config.model_name,
+            model_path=resolved_model_path,
+            model_type=config.model_type,
+            probe_texts=probe_texts,
+            extractor_type=config.extractor_type,
+            model_metadata=model_meta,
+            args=args,
+        )
+        vector = _validate_signature(signature)
+
     elapsed_seconds = time.time() - start_time
 
     output_path: Optional[Path] = None
@@ -493,6 +671,7 @@ def calc_dna_parallel(
     config: DNAExtractionConfig,
     llm_list: Optional[Path | str] = None,
     gpu_ids: Optional[list[int]] = None,
+    n_processes: Optional[int] = None,
     continue_on_error: bool = False,
     sentence_encoder: str = "all-mpnet-base-v2",
     encoder_device: str = "auto",
@@ -542,18 +721,40 @@ def calc_dna_parallel(
         raise ValueError("Probe set must contain at least two prompts for dimensionality reduction.")
 
     generation_devices = _resolve_generation_devices(config, gpu_ids)
+    worker_devices = list(generation_devices)
+    if n_processes is not None:
+        worker_count = int(n_processes)
+        if worker_count <= 0:
+            raise ValueError("n_processes must be >= 1 when provided.")
+        if _is_api_parallel_mode(config, model_names):
+            worker_devices = [
+                generation_devices[idx % len(generation_devices)]
+                for idx in range(worker_count)
+            ]
+            logging.info(
+                "Using API submission worker pool with n_processes=%d over devices=%s",
+                worker_count,
+                generation_devices,
+            )
+        elif worker_count != len(generation_devices):
+            logging.warning(
+                "Ignoring n_processes=%d for non-API workload; using %d generation worker(s).",
+                worker_count,
+                len(generation_devices),
+            )
+
     logging.info(
         "Starting batch generation for %d model(s) across %d worker device(s): %s",
         len(model_names),
-        len(generation_devices),
-        generation_devices,
+        len(worker_devices),
+        worker_devices,
     )
 
     task_queue: queue.Queue[Optional[str]] = queue.Queue()
     result_queue: queue.Queue[dict[str, Any]] = queue.Queue()
     for model_name in model_names:
         task_queue.put(model_name)
-    for _ in generation_devices:
+    for _ in worker_devices:
         task_queue.put(None)
 
     def _worker(device: str) -> None:
@@ -564,23 +765,26 @@ def calc_dna_parallel(
 
             started = time.time()
             try:
-                model_meta = _load_model_metadata_for_model(
-                    model_name=model_name,
-                    metadata_file=metadata_file,
-                    token=resolved_token,
-                )
-                if model_meta.get("architecture", {}).get("is_generative") is False:
-                    arch_type = model_meta.get("architecture", {}).get("type")
-                    raise ValueError(
-                        f"Model '{model_name}' is non-generative (architecture={arch_type})."
-                    )
-
                 response_path = _response_cache_path(config, model_name)
                 responses: Optional[list[str]] = None
                 if use_response_cache:
                     responses = _load_cached_responses(response_path, expected_count=len(probe_texts))
 
-                if responses is None:
+                if responses is not None:
+                    # Cached responses allow downstream encoding without provider API keys.
+                    model_meta = _default_model_metadata(model_name)
+                else:
+                    model_meta = _load_model_metadata_for_model(
+                        model_name=model_name,
+                        metadata_file=metadata_file,
+                        token=resolved_token,
+                    )
+                    if model_meta.get("architecture", {}).get("is_generative") is False:
+                        arch_type = model_meta.get("architecture", {}).get("type")
+                        raise ValueError(
+                            f"Model '{model_name}' is non-generative (architecture={arch_type})."
+                        )
+
                     responses = _generate_responses_for_model(
                         model_name=model_name,
                         config=config,
@@ -588,6 +792,7 @@ def calc_dna_parallel(
                         probe_texts=probe_texts,
                         device=device,
                         resolved_token=resolved_token,
+                        incremental_save_path=response_path if use_response_cache else None,
                     )
                     if use_response_cache:
                         _save_response_cache(
@@ -619,7 +824,7 @@ def calc_dna_parallel(
                     }
                 )
 
-    threads = [threading.Thread(target=_worker, args=(device,), daemon=True) for device in generation_devices]
+    threads = [threading.Thread(target=_worker, args=(device,), daemon=True) for device in worker_devices]
     for thread in threads:
         thread.start()
 
@@ -673,7 +878,7 @@ def calc_dna_parallel(
         model_slices[payload["model_name"]] = (start, len(all_responses))
 
     if encoder_device == "auto":
-        encoder_device = generation_devices[0] if generation_devices else "cpu"
+        encoder_device = worker_devices[0] if worker_devices else "cpu"
 
     logging.info(
         "Encoding %d response(s) with sentence encoder '%s' on %s",

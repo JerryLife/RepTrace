@@ -70,6 +70,12 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Comma-separated GPU IDs (used for round-robin assignment).",
     )
     parser.add_argument(
+        "--n-processes",
+        type=int,
+        default=None,
+        help="Number of parallel API submission workers for batch llm-list runs.",
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Continue remaining models if one model fails.",
@@ -86,7 +92,7 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--model-type",
         type=str,
         default="auto",
-        choices=["auto", "huggingface", "openai", "gemini"],
+        choices=["auto", "huggingface", "openai", "openrouter", "gemini", "anthropic"],
     )
 
     # Dataset and probes
@@ -222,6 +228,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 config=batch_config,
                 llm_list=args.llm_list,
                 gpu_ids=gpu_ids if gpu_ids else None,
+                n_processes=args.n_processes,
                 continue_on_error=args.continue_on_error,
             )
         except Exception as exc:

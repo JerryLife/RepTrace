@@ -124,23 +124,54 @@ class LLMWrapper(ABC):
         """Batch generation default implementation: sequential calls.
 
         Subclasses may override to provide true batched generation.
+        
+        Args:
+            prompts: List of input prompts
+            max_length: Maximum generation length
+            temperature: Sampling temperature
+            do_sample: Whether to use sampling
+            top_p: Top-p sampling parameter
+            show_progress: Show tqdm progress bar (default: True)
+            on_response_callback: Optional callback(index, prompt, response) called after each response.
+                                  Use for incremental saving to preserve partial results.
         """
         outputs: List[str] = []
-        for p in prompts:
+        show_progress = kwargs.pop("show_progress", True)
+        on_response_callback = kwargs.pop("on_response_callback", None)
+        
+        iterator = enumerate(prompts)
+        if show_progress and len(prompts) > 1:
+            iterator = tqdm(
+                list(enumerate(prompts)),
+                desc=f"Generating ({self.model_name})",
+                unit="prompt",
+                leave=True,
+                dynamic_ncols=True,
+            )
+        
+        for idx, p in iterator:
+            response = ""
             try:
-                outputs.append(
-                    self.generate(
-                        p,
-                        max_length=max_length,
-                        temperature=temperature,
-                        do_sample=do_sample,
-                        top_p=top_p,
-                        **kwargs,
-                    )
+                response = self.generate(
+                    p,
+                    max_length=max_length,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    top_p=top_p,
+                    **kwargs,
                 )
             except Exception as e:
-                self.logger.error(f"Batch item failed: {e}")
-                outputs.append("")
+                self.logger.error(f"Batch item {idx} failed: {e}")
+            
+            outputs.append(response)
+            
+            # Call the callback for incremental saving (e.g., to disk)
+            if on_response_callback is not None:
+                try:
+                    on_response_callback(idx, p, response)
+                except Exception as cb_err:
+                    self.logger.warning(f"Response callback failed for item {idx}: {cb_err}")
+        
         return outputs
 
     @staticmethod
@@ -1337,6 +1368,8 @@ class OpenAIWrapper(LLMWrapper):
         if not prompts:
             return []
 
+        on_response_callback = kwargs.pop("on_response_callback", None)
+        show_progress = bool(kwargs.pop("show_progress", True))
         prefer_batch_api = bool(kwargs.pop("prefer_batch_api", self.prefer_batch_api))
         max_requests = int(kwargs.pop("batch_max_requests", self.batch_max_requests))
         poll_interval = float(kwargs.pop("batch_poll_interval_seconds", self.batch_poll_interval_seconds))
@@ -1353,10 +1386,13 @@ class OpenAIWrapper(LLMWrapper):
                 temperature=temperature,
                 do_sample=do_sample,
                 top_p=top_p,
+                show_progress=show_progress,
+                on_response_callback=on_response_callback,
                 **kwargs,
             )
 
         responses: List[str] = [""] * len(prompts)
+        resolved_indices: set[int] = set()
         try:
             chunks = self._iter_chunks(prompts, max(1, max_requests))
             for start_index, prompt_chunk in chunks:
@@ -1384,20 +1420,41 @@ class OpenAIWrapper(LLMWrapper):
                 parsed = self._parse_openai_batch_output(
                     self._download_openai_output(output_file_id)
                 )
-                for idx, text in parsed.items():
-                    if 0 <= idx < len(responses):
-                        responses[idx] = text
+                for chunk_offset, prompt in enumerate(prompt_chunk):
+                    idx = start_index + chunk_offset
+                    if idx in parsed:
+                        responses[idx] = parsed[idx]
+                    resolved_indices.add(idx)
+                    if on_response_callback is not None:
+                        try:
+                            on_response_callback(idx, prompt, responses[idx])
+                        except Exception as cb_err:
+                            self.logger.warning("Response callback failed for item %d: %s", idx, cb_err)
             return responses
         except Exception as exc:
             self.logger.warning("%s batch API failed; falling back to sequential calls: %s", self.provider_name, exc)
-            return super().generate_batch(
-                prompts,
-                max_length=max_length,
-                temperature=temperature,
-                do_sample=do_sample,
-                top_p=top_p,
-                **kwargs,
-            )
+            for idx, prompt in enumerate(prompts):
+                if idx in resolved_indices:
+                    continue
+                response = ""
+                try:
+                    response = self.generate(
+                        prompt,
+                        max_length=max_length,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        top_p=top_p,
+                        **kwargs,
+                    )
+                except Exception as seq_exc:
+                    self.logger.error("Batch fallback item %d failed: %s", idx, seq_exc)
+                responses[idx] = response
+                if on_response_callback is not None:
+                    try:
+                        on_response_callback(idx, prompt, response)
+                    except Exception as cb_err:
+                        self.logger.warning("Response callback failed for item %d: %s", idx, cb_err)
+            return responses
             
     def get_logits(self, input_text: str) -> torch.Tensor:
         """OpenAI API doesn't provide logits access."""
@@ -1950,6 +2007,8 @@ class GeminiWrapper(LLMWrapper):
         if not prompts:
             return []
 
+        on_response_callback = kwargs.pop("on_response_callback", None)
+        show_progress = bool(kwargs.pop("show_progress", True))
         prefer_batch_api = bool(kwargs.pop("prefer_batch_api", self.prefer_batch_api))
         max_requests = int(kwargs.pop("batch_max_requests", self.batch_max_requests))
         max_payload_bytes = int(kwargs.pop("batch_max_payload_bytes", self.batch_max_payload_bytes))
@@ -1966,10 +2025,13 @@ class GeminiWrapper(LLMWrapper):
                 temperature=temperature,
                 do_sample=do_sample,
                 top_p=top_p,
+                show_progress=show_progress,
+                on_response_callback=on_response_callback,
                 **kwargs,
             )
 
         responses: List[str] = [""] * len(prompts)
+        resolved_indices: set[int] = set()
         try:
             request_chunks = self._iter_gemini_request_chunks(
                 prompts=prompts,
@@ -1989,20 +2051,46 @@ class GeminiWrapper(LLMWrapper):
                     timeout_seconds=timeout,
                 )
                 parsed = self._parse_gemini_batch_response(info)
-                for idx, text in parsed.items():
+                for request_obj in request_chunk:
+                    metadata = request_obj.get("metadata", {}) if isinstance(request_obj, dict) else {}
+                    key_value = metadata.get("key")
+                    try:
+                        idx = int(str(key_value))
+                    except Exception:
+                        continue
                     if 0 <= idx < len(responses):
-                        responses[idx] = text
+                        responses[idx] = parsed.get(idx, "")
+                        resolved_indices.add(idx)
+                        if on_response_callback is not None:
+                            try:
+                                on_response_callback(idx, prompts[idx], responses[idx])
+                            except Exception as cb_err:
+                                self.logger.warning("Response callback failed for item %d: %s", idx, cb_err)
             return responses
         except Exception as exc:
             self.logger.warning("Gemini batch API failed; falling back to sequential calls: %s", exc)
-            return super().generate_batch(
-                prompts,
-                max_length=max_length,
-                temperature=temperature,
-                do_sample=do_sample,
-                top_p=top_p,
-                **kwargs,
-            )
+            for idx, prompt in enumerate(prompts):
+                if idx in resolved_indices:
+                    continue
+                response = ""
+                try:
+                    response = self.generate(
+                        prompt,
+                        max_length=max_length,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        top_p=top_p,
+                        **kwargs,
+                    )
+                except Exception as seq_exc:
+                    self.logger.error("Batch fallback item %d failed: %s", idx, seq_exc)
+                responses[idx] = response
+                if on_response_callback is not None:
+                    try:
+                        on_response_callback(idx, prompt, response)
+                    except Exception as cb_err:
+                        self.logger.warning("Response callback failed for item %d: %s", idx, cb_err)
+            return responses
 
     def get_logits(self, input_text: str) -> torch.Tensor:
         raise NotImplementedError("Gemini API models don't provide logits access")

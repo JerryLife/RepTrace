@@ -275,6 +275,33 @@ def test_openrouter_wrapper_generate_batch_uses_batch_api(monkeypatch):
     assert client.batch_counter == 1
 
 
+def test_openrouter_wrapper_batch_callback_does_not_break_payload(monkeypatch):
+    _install_fake_tiktoken(monkeypatch)
+    client = _FakeOpenAIClient(fail_batch_create=False)
+    _install_fake_openai(monkeypatch, client)
+
+    callback_events = []
+
+    wrapper = OpenRouterWrapper(model_name="openai/gpt-3.5-turbo", api_key="test-key")
+    outputs = wrapper.generate_batch(
+        ["prompt-0", "prompt-1"],
+        max_length=64,
+        temperature=0.0,
+        do_sample=False,
+        top_p=1.0,
+        batch_poll_interval_seconds=0.01,
+        on_response_callback=lambda idx, prompt, response: callback_events.append((idx, prompt, response)),
+        show_progress=False,
+    )
+
+    assert outputs == ["batch:prompt-0", "batch:prompt-1"]
+    assert callback_events == [
+        (0, "prompt-0", "batch:prompt-0"),
+        (1, "prompt-1", "batch:prompt-1"),
+    ]
+    assert client.batch_counter == 1
+
+
 def test_openrouter_wrapper_batch_falls_back_to_sequential(monkeypatch):
     _install_fake_tiktoken(monkeypatch)
     client = _FakeOpenAIClient(fail_batch_create=True)
@@ -514,6 +541,8 @@ def test_model_loader_detects_provider_model_patterns(monkeypatch):
     assert loader._detect_model_type("openai/gpt-4o-mini") == "openrouter"
     assert loader._detect_model_type("anthropic/claude-3.5-sonnet") == "openrouter"
     assert loader._detect_model_type("google/gemini-2.0-flash") == "openrouter"
+    assert loader._detect_model_type("z-ai/glm-4.7") == "openrouter"
+    assert loader._detect_model_type("deepseek/deepseek-v3.2") == "openrouter"
     assert loader._detect_model_type("gemini-2.0-flash") == "gemini"
     assert loader._detect_model_type("Gemini-1.5-pro") == "gemini"  # Case insensitive
     assert loader._detect_model_type("meta-llama/Llama-3-8B") == "huggingface"  # Default
