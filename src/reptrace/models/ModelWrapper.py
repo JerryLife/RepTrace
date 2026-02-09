@@ -1120,6 +1120,7 @@ class VLLMWrapper(LLMWrapper):
 
 class OpenAIWrapper(LLMWrapper):
     """Wrapper for OpenAI API models."""
+    provider_name = "OpenAI"
     
     def __init__(
         self,
@@ -1221,7 +1222,7 @@ class OpenAIWrapper(LLMWrapper):
             endpoint="/v1/chat/completions",
             completion_window=completion_window,
         )
-        self.logger.info("OpenAI batch submitted: id=%s size=%d", batch.id, len(requests))
+        self.logger.info("%s batch submitted: id=%s size=%d", self.provider_name, batch.id, len(requests))
         return batch.id
 
     def _wait_openai_batch(
@@ -1236,21 +1237,21 @@ class OpenAIWrapper(LLMWrapper):
             batch = self.client.batches.retrieve(batch_id)
             status = str(getattr(batch, "status", "")).lower()
             if status != last_status:
-                self.logger.info("OpenAI batch %s status=%s", batch_id, status)
+                self.logger.info("%s batch %s status=%s", self.provider_name, batch_id, status)
                 last_status = status
 
             if status in {"completed", "done"}:
                 return batch
             if status in {"failed", "cancelled", "canceled", "expired", "error"}:
                 error_obj = getattr(batch, "error", None)
-                raise RuntimeError(f"OpenAI batch {batch_id} failed with status={status}: {error_obj}")
+                raise RuntimeError(f"{self.provider_name} batch {batch_id} failed with status={status}: {error_obj}")
 
             if timeout_seconds is not None and (time.time() - started) > timeout_seconds:
                 try:
                     self.client.batches.cancel(batch_id)
                 except Exception:
                     pass
-                raise TimeoutError(f"OpenAI batch {batch_id} timed out after {timeout_seconds}s")
+                raise TimeoutError(f"{self.provider_name} batch {batch_id} timed out after {timeout_seconds}s")
 
             time.sleep(max(0.1, poll_interval_seconds))
 
@@ -1266,7 +1267,7 @@ class OpenAIWrapper(LLMWrapper):
                 return raw
             if isinstance(raw, str):
                 return raw.encode("utf-8")
-        raise ValueError("Unsupported OpenAI file content type")
+        raise ValueError(f"Unsupported {self.provider_name} file content type")
 
     def _parse_openai_batch_output(self, raw_content: bytes) -> Dict[int, str]:
         responses: Dict[int, str] = {}
@@ -1278,7 +1279,7 @@ class OpenAIWrapper(LLMWrapper):
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
-                self.logger.warning("Skipping invalid OpenAI batch JSONL line: %s", line[:120])
+                self.logger.warning("Skipping invalid %s batch JSONL line: %s", self.provider_name, line[:120])
                 continue
 
             index = self._parse_custom_id(record.get("custom_id"))
@@ -1321,7 +1322,7 @@ class OpenAIWrapper(LLMWrapper):
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            self.logger.error(f"OpenAI API error: {e}")
+            self.logger.error("%s API error: %s", self.provider_name, e)
             return ""
 
     def generate_batch(
@@ -1379,7 +1380,7 @@ class OpenAIWrapper(LLMWrapper):
                 )
                 output_file_id = getattr(batch, "output_file_id", None)
                 if not output_file_id:
-                    raise RuntimeError(f"OpenAI batch {batch_id} completed without output_file_id")
+                    raise RuntimeError(f"{self.provider_name} batch {batch_id} completed without output_file_id")
                 parsed = self._parse_openai_batch_output(
                     self._download_openai_output(output_file_id)
                 )
@@ -1388,7 +1389,7 @@ class OpenAIWrapper(LLMWrapper):
                         responses[idx] = text
             return responses
         except Exception as exc:
-            self.logger.warning("OpenAI batch API failed; falling back to sequential calls: %s", exc)
+            self.logger.warning("%s batch API failed; falling back to sequential calls: %s", self.provider_name, exc)
             return super().generate_batch(
                 prompts,
                 max_length=max_length,
@@ -1431,9 +1432,10 @@ class OpenAIWrapper(LLMWrapper):
         }
 
 
-class OpenRouterWrapper(LLMWrapper):
+class OpenRouterWrapper(OpenAIWrapper):
     """Wrapper for OpenRouter API models (compatible with OpenAI API)."""
-    
+    provider_name = "OpenRouter"
+
     def __init__(
         self,
         model_name: str,
@@ -1446,206 +1448,49 @@ class OpenRouterWrapper(LLMWrapper):
         http_referer: Optional[str] = None,
         x_title: Optional[str] = None,
     ):
-        super().__init__(model_name, device)
         # Get API key from environment if not provided
         api_key = (
-            api_key 
-            or os.getenv("OPENROUTER_API_KEY") 
+            api_key
+            or os.getenv("OPENROUTER_API_KEY")
             or os.getenv("APIKEY_OPENROUTER")
             or os.getenv("OPENROUTER_KEY")
         )
-        
+
         if not api_key:
             raise ValueError("OpenRouter API key required. Set OPENROUTER_API_KEY environment variable.")
-        
+
+        super().__init__(
+            model_name=model_name,
+            api_key=api_key,
+            device=device,
+            batch_poll_interval_seconds=batch_poll_interval_seconds,
+            batch_timeout_seconds=batch_timeout_seconds,
+            batch_max_requests=batch_max_requests,
+            prefer_batch_api=prefer_batch_api,
+        )
+
         try:
             import openai
-            # OpenRouter uses OpenAI-compatible API but with different base URL
+            # OpenRouter uses OpenAI-compatible API with a custom base URL.
             self.client = openai.OpenAI(
                 api_key=api_key,
-                base_url="https://openrouter.ai/api/v1"
+                base_url="https://openrouter.ai/api/v1",
             )
         except ImportError:
             raise ImportError("OpenAI package not installed. Install with: pip install openai")
 
-        self.batch_poll_interval_seconds = max(0.1, float(batch_poll_interval_seconds))
-        self.batch_timeout_seconds = batch_timeout_seconds
-        self.batch_max_requests = max(1, int(batch_max_requests))
-        self.prefer_batch_api = bool(prefer_batch_api)
         self.http_referer = http_referer or os.getenv("OPENROUTER_HTTP_REFERER")
         self.x_title = x_title or os.getenv("OPENROUTER_X_TITLE")
-            
-        # OpenRouter models don't have local tokenizers, use tiktoken
-        try:
-            import tiktoken
-            self.tokenizer = tiktoken.encoding_for_model(model_name)
-        except Exception:
-            try:
-                import tiktoken
-                self.tokenizer = tiktoken.get_encoding("cl100k_base")  # Default encoding
-            except Exception:
-                self.tokenizer = None
 
     def _get_extra_headers(self) -> Dict[str, str]:
-        """Get extra headers for OpenRouter API requests."""
-        headers = {}
+        """Get optional headers supported by OpenRouter."""
+        headers: Dict[str, str] = {}
         if self.http_referer:
             headers["HTTP-Referer"] = self.http_referer
         if self.x_title:
             headers["X-Title"] = self.x_title
         return headers
 
-    @staticmethod
-    def _extract_openai_text(choice: Dict[str, Any]) -> str:
-        """Extract text from OpenAI-compatible response choice."""
-        message = choice.get("message", {}) if isinstance(choice, dict) else {}
-        content = message.get("content")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts: List[str] = []
-            for item in content:
-                if isinstance(item, dict) and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-            return "\n".join(parts).strip()
-        return ""
-
-    @staticmethod
-    def _parse_custom_id(custom_id: Any) -> Optional[int]:
-        """Parse custom_id from batch request."""
-        if not isinstance(custom_id, str):
-            return None
-        prefix = "prompt_"
-        if not custom_id.startswith(prefix):
-            return None
-        try:
-            return int(custom_id[len(prefix):])
-        except ValueError:
-            return None
-
-    def _build_openai_batch_requests(
-        self,
-        prompts: List[str],
-        start_index: int,
-        max_length: int,
-        temperature: float,
-        do_sample: bool,
-        top_p: float,
-        request_kwargs: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        """Build batch requests for OpenRouter API."""
-        requests: List[Dict[str, Any]] = []
-        for offset, prompt in enumerate(prompts):
-            request = {
-                "custom_id": f"prompt_{start_index + offset}",
-                "method": "POST",
-                "url": "/v1/chat/completions",
-                "body": {
-                    "model": self.model_name,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": int(max_length),
-                    "temperature": float(temperature),
-                    "top_p": float(top_p if do_sample else 1.0),
-                    **request_kwargs,
-                },
-            }
-            requests.append(request)
-        return requests
-
-    def _submit_openai_batch(self, requests: List[Dict[str, Any]], completion_window: str) -> str:
-        """Submit batch requests to OpenRouter API."""
-        payload_lines = [json.dumps(request, ensure_ascii=False) for request in requests]
-        payload = "\n".join(payload_lines).encode("utf-8")
-        file_obj = io.BytesIO(payload)
-        file_obj.name = "reptrace_batch_requests.jsonl"
-        uploaded = self.client.files.create(file=file_obj, purpose="batch")
-        batch = self.client.batches.create(
-            input_file_id=uploaded.id,
-            endpoint="/v1/chat/completions",
-            completion_window=completion_window,
-        )
-        self.logger.info("OpenRouter batch submitted: id=%s size=%d", batch.id, len(requests))
-        return batch.id
-
-    def _wait_openai_batch(
-        self,
-        batch_id: str,
-        poll_interval_seconds: float,
-        timeout_seconds: Optional[float],
-    ) -> Any:
-        """Wait for batch completion."""
-        started = time.time()
-        last_status: Optional[str] = None
-        while True:
-            batch = self.client.batches.retrieve(batch_id)
-            status = str(getattr(batch, "status", "")).lower()
-            if status != last_status:
-                self.logger.info("OpenRouter batch %s status=%s", batch_id, status)
-                last_status = status
-
-            if status in {"completed", "done"}:
-                return batch
-            if status in {"failed", "cancelled", "canceled", "expired", "error"}:
-                error_obj = getattr(batch, "error", None)
-                raise RuntimeError(f"OpenRouter batch {batch_id} failed with status={status}: {error_obj}")
-
-            if timeout_seconds is not None and (time.time() - started) > timeout_seconds:
-                try:
-                    self.client.batches.cancel(batch_id)
-                except Exception:
-                    pass
-                raise TimeoutError(f"OpenRouter batch {batch_id} timed out after {timeout_seconds}s")
-
-            time.sleep(max(0.1, poll_interval_seconds))
-
-    def _download_openai_output(self, output_file_id: str) -> bytes:
-        """Download batch output file."""
-        output = self.client.files.content(output_file_id)
-        if isinstance(output, bytes):
-            return output
-        if isinstance(output, str):
-            return output.encode("utf-8")
-        if hasattr(output, "read"):
-            raw = output.read()
-            if isinstance(raw, bytes):
-                return raw
-            if isinstance(raw, str):
-                return raw.encode("utf-8")
-        raise ValueError("Unsupported OpenRouter file content type")
-
-    def _parse_openai_batch_output(self, raw_content: bytes) -> Dict[int, str]:
-        """Parse batch output JSONL."""
-        responses: Dict[int, str] = {}
-        text = raw_content.decode("utf-8", errors="replace")
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                self.logger.warning("Skipping invalid OpenRouter batch JSONL line: %s", line[:120])
-                continue
-
-            index = self._parse_custom_id(record.get("custom_id"))
-            if index is None:
-                continue
-
-            response_obj = record.get("response", {})
-            body = response_obj.get("body", response_obj) if isinstance(response_obj, dict) else {}
-            if isinstance(body, str):
-                try:
-                    body = json.loads(body)
-                except json.JSONDecodeError:
-                    body = {}
-
-            choices = body.get("choices", []) if isinstance(body, dict) else []
-            if not choices:
-                responses[index] = ""
-                continue
-            responses[index] = self._extract_openai_text(choices[0])
-        return responses
-            
     def generate(
         self,
         input_text: str,
@@ -1657,175 +1502,85 @@ class OpenRouterWrapper(LLMWrapper):
     ) -> str:
         """Generate text from input using OpenRouter API."""
         try:
-            # Add extra headers if available
+            request_kwargs = dict(kwargs)
             extra_headers = self._get_extra_headers()
             if extra_headers:
-                # Note: OpenAI client doesn't directly support custom headers in chat.completions.create
-                # We'll need to set them via default_headers if the client supports it
-                # For now, OpenRouter should work without these headers
-                pass
-            
+                existing = request_kwargs.get("extra_headers")
+                if isinstance(existing, dict):
+                    request_kwargs["extra_headers"] = {**extra_headers, **existing}
+                else:
+                    request_kwargs["extra_headers"] = extra_headers
+
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[{"role": "user", "content": input_text}],
                 max_tokens=max_length,
                 temperature=temperature,
                 top_p=top_p if do_sample else 1.0,
-                **kwargs
+                **request_kwargs
             )
-            
+
             # Extract content from response
             choice = response.choices[0]
             content = choice.message.content
-            finish_reason = getattr(choice, 'finish_reason', None)
-            
+            finish_reason = getattr(choice, "finish_reason", None)
+
             # For reasoning models: they have both content (final answer) and reasoning (thinking process)
-            # Check if this is a reasoning model response
+            # Check if this is a reasoning model response.
             has_reasoning = False
-            if hasattr(choice.message, 'model_dump'):
+            if hasattr(choice.message, "model_dump"):
                 msg_dict = choice.message.model_dump()
-                reasoning = msg_dict.get('reasoning')
-                reasoning_details = msg_dict.get('reasoning_details')
+                reasoning = msg_dict.get("reasoning")
+                reasoning_details = msg_dict.get("reasoning_details")
                 has_reasoning = bool(reasoning or reasoning_details)
-            
-            # If content is empty but we have reasoning, it might be due to max_tokens being too small
-            # Reasoning models need more tokens: reasoning process + final answer
+
+            # If content is empty but we have reasoning, it might be due to max_tokens being too small.
+            # Reasoning models need more tokens: reasoning process + final answer.
             if not content or not content.strip():
-                if has_reasoning and finish_reason == 'length':
-                    # Response was truncated - reasoning models need larger max_tokens
+                if has_reasoning and finish_reason == "length":
                     self.logger.warning(
-                        f"OpenRouter reasoning model {self.model_name} response was truncated (finish_reason=length). "
-                        f"Content is empty because max_tokens ({max_length}) was too small. "
-                        f"Reasoning models need more tokens for both reasoning and final answer. "
-                        f"Consider increasing max_tokens."
+                        "OpenRouter reasoning model %s response was truncated (finish_reason=length). "
+                        "Content is empty because max_tokens (%s) was too small. "
+                        "Reasoning models need more tokens for both reasoning and final answer. "
+                        "Consider increasing max_tokens.",
+                        self.model_name,
+                        max_length,
                     )
-                
-                # Fallback: use reasoning if content is missing (only as last resort)
-                if hasattr(choice.message, 'model_dump'):
+
+                # Fallback: use reasoning if content is missing (only as last resort).
+                if hasattr(choice.message, "model_dump"):
                     msg_dict = choice.message.model_dump()
-                    reasoning = msg_dict.get('reasoning')
+                    reasoning = msg_dict.get("reasoning")
                     if reasoning and isinstance(reasoning, str) and reasoning.strip():
                         self.logger.warning(
-                            f"OpenRouter model {self.model_name} returned reasoning but no content. "
-                            f"Using reasoning as fallback. This may indicate max_tokens was too small."
+                            "OpenRouter model %s returned reasoning but no content. "
+                            "Using reasoning as fallback. This may indicate max_tokens was too small.",
+                            self.model_name,
                         )
                         content = reasoning
                     else:
-                        # Check reasoning_details
-                        reasoning_details = msg_dict.get('reasoning_details')
+                        reasoning_details = msg_dict.get("reasoning_details")
                         if isinstance(reasoning_details, list) and reasoning_details:
                             for item in reasoning_details:
                                 if isinstance(item, dict):
-                                    text = item.get('text')
+                                    text = item.get("text")
                                     if text and text.strip():
                                         content = text
                                         self.logger.warning(
-                                            f"OpenRouter model {self.model_name} returned reasoning_details but no content."
+                                            "OpenRouter model %s returned reasoning_details but no content.",
+                                            self.model_name,
                                         )
                                         break
-            
+
             return content.strip() if content else ""
         except Exception as e:
-            self.logger.error(f"OpenRouter API error: {e}")
+            self.logger.error("%s API error: %s", self.provider_name, e)
             return ""
 
-    def generate_batch(
-        self,
-        prompts: List[str],
-        max_length: int = 1024,
-        temperature: float = 0.7,
-        do_sample: bool = True,
-        top_p: float = 0.9,
-        **kwargs
-    ) -> List[str]:
-        """Generate text for multiple prompts using OpenRouter API."""
-        if not prompts:
-            return []
-
-        prefer_batch_api = bool(kwargs.pop("prefer_batch_api", self.prefer_batch_api))
-        max_requests = int(kwargs.pop("batch_max_requests", self.batch_max_requests))
-        poll_interval = float(kwargs.pop("batch_poll_interval_seconds", self.batch_poll_interval_seconds))
-        timeout = kwargs.pop("batch_timeout_seconds", self.batch_timeout_seconds)
-        completion_window = str(kwargs.pop("batch_completion_window", "24h"))
-
-        # Wrapper-only kwargs should not be forwarded to the provider payload.
-        kwargs.pop("skip_chat_template", None)
-
-        if not prefer_batch_api:
-            return super().generate_batch(
-                prompts,
-                max_length=max_length,
-                temperature=temperature,
-                do_sample=do_sample,
-                top_p=top_p,
-                **kwargs,
-            )
-
-        responses: List[str] = [""] * len(prompts)
-        try:
-            chunks = self._iter_chunks(prompts, max(1, max_requests))
-            for start_index, prompt_chunk in chunks:
-                batch_requests = self._build_openai_batch_requests(
-                    prompts=prompt_chunk,
-                    start_index=start_index,
-                    max_length=max_length,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    top_p=top_p,
-                    request_kwargs=kwargs,
-                )
-                batch_id = self._submit_openai_batch(
-                    requests=batch_requests,
-                    completion_window=completion_window,
-                )
-                batch = self._wait_openai_batch(
-                    batch_id=batch_id,
-                    poll_interval_seconds=poll_interval,
-                    timeout_seconds=timeout,
-                )
-                output_file_id = getattr(batch, "output_file_id", None)
-                if not output_file_id:
-                    raise RuntimeError(f"OpenRouter batch {batch_id} completed without output_file_id")
-                parsed = self._parse_openai_batch_output(
-                    self._download_openai_output(output_file_id)
-                )
-                for idx, text in parsed.items():
-                    if 0 <= idx < len(responses):
-                        responses[idx] = text
-            return responses
-        except Exception as exc:
-            self.logger.warning("OpenRouter batch API failed; falling back to sequential calls: %s", exc)
-            return super().generate_batch(
-                prompts,
-                max_length=max_length,
-                temperature=temperature,
-                do_sample=do_sample,
-                top_p=top_p,
-                **kwargs,
-            )
-            
     def get_logits(self, input_text: str) -> torch.Tensor:
         """OpenRouter API doesn't provide logits access."""
         raise NotImplementedError("OpenRouter API models don't provide logits access")
-        
-    def tokenize(self, text: str) -> List[int]:
-        """Tokenize text using tiktoken."""
-        if self.tokenizer is None:
-            return [ord(ch) for ch in text]
-        return self.tokenizer.encode(text)
-        
-    def detokenize(self, token_ids: List[int]) -> str:
-        """Detokenize using tiktoken."""
-        if self.tokenizer is None:
-            return " ".join(str(token_id) for token_id in token_ids)
-        return self.tokenizer.decode(token_ids)
-        
-    def get_vocab_size(self) -> int:
-        """Get vocabulary size (approximate for tiktoken)."""
-        if self.tokenizer is None:
-            return 0
-        return self.tokenizer.n_vocab
-        
+
     def get_model_metadata(self) -> Dict[str, Any]:
         """Get model metadata."""
         return {

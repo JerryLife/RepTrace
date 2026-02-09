@@ -68,6 +68,21 @@ class ModelLoader:
         if any(model_lower.startswith(prefix) for prefix in openai_prefixes):
             return "openai"
 
+        # Check for OpenRouter model names.
+        # Keep this conservative to avoid misclassifying common HuggingFace IDs.
+        openrouter_prefixes = [
+            "openrouter/",
+            "openrouter:",
+            "anthropic/claude-",
+            "openai/gpt-",
+            "google/gemini-",
+            "x-ai/grok-",
+            "cohere/command",
+            "perplexity/",
+        ]
+        if any(model_lower.startswith(prefix) for prefix in openrouter_prefixes):
+            return "openrouter"
+
         # Check for Google Gemini model names
         gemini_prefixes = [
             "gemini-",

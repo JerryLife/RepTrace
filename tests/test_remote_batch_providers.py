@@ -7,8 +7,10 @@ import logging
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from reptrace.models.ModelLoader import ModelLoader
-from reptrace.models.ModelWrapper import GeminiWrapper, OpenAIWrapper
+from reptrace.models.ModelWrapper import GeminiWrapper, OpenAIWrapper, OpenRouterWrapper
 
 
 class _FakeEncoding:
@@ -136,7 +138,7 @@ class _FakeOpenAIClient:
 
 
 def _install_fake_openai(monkeypatch, client: _FakeOpenAIClient):
-    module = SimpleNamespace(OpenAI=lambda api_key=None: client)
+    module = SimpleNamespace(OpenAI=lambda api_key=None, **kwargs: client)
     monkeypatch.setitem(sys.modules, "openai", module)
 
 
@@ -253,6 +255,111 @@ def test_openai_wrapper_error_response_parsing():
     assert parsed[1] == ""
 
 
+def test_openrouter_wrapper_generate_batch_uses_batch_api(monkeypatch):
+    _install_fake_tiktoken(monkeypatch)
+    client = _FakeOpenAIClient(fail_batch_create=False)
+    _install_fake_openai(monkeypatch, client)
+
+    wrapper = OpenRouterWrapper(model_name="openai/gpt-3.5-turbo", api_key="test-key")
+    outputs = wrapper.generate_batch(
+        ["prompt-0", "prompt-1", "prompt-2"],
+        max_length=64,
+        temperature=0.0,
+        do_sample=False,
+        top_p=1.0,
+        batch_poll_interval_seconds=0.01,
+    )
+
+    assert outputs == ["batch:prompt-0", "batch:prompt-1", "batch:prompt-2"]
+    assert client.retrieve_calls >= 2
+    assert client.batch_counter == 1
+
+
+def test_openrouter_wrapper_batch_falls_back_to_sequential(monkeypatch):
+    _install_fake_tiktoken(monkeypatch)
+    client = _FakeOpenAIClient(fail_batch_create=True)
+    _install_fake_openai(monkeypatch, client)
+
+    wrapper = OpenRouterWrapper(model_name="openai/gpt-3.5-turbo", api_key="test-key")
+    outputs = wrapper.generate_batch(
+        ["alpha", "beta"],
+        max_length=64,
+        temperature=0.0,
+        do_sample=False,
+        top_p=1.0,
+        batch_poll_interval_seconds=0.01,
+    )
+
+    assert outputs == ["seq:alpha", "seq:beta"]
+
+
+def test_openrouter_wrapper_generate_uses_reasoning_fallback(monkeypatch):
+    _install_fake_tiktoken(monkeypatch)
+    client = _FakeOpenAIClient(fail_batch_create=False)
+    _install_fake_openai(monkeypatch, client)
+
+    wrapper = OpenRouterWrapper(model_name="openrouter/pony-alpha", api_key="test-key")
+
+    class _ReasoningMessage:
+        content = ""
+
+        @staticmethod
+        def model_dump():
+            return {"reasoning": "ACCESS_OK"}
+
+    def _reasoning_create(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=_ReasoningMessage(),
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+    monkeypatch.setattr(wrapper.client.chat.completions, "create", _reasoning_create)
+    assert wrapper.generate("test prompt", max_length=16, temperature=0.0, do_sample=False) == "ACCESS_OK"
+
+
+def test_openrouter_wrapper_generate_error_returns_empty(monkeypatch):
+    _install_fake_tiktoken(monkeypatch)
+    client = _FakeOpenAIClient(fail_batch_create=False)
+    _install_fake_openai(monkeypatch, client)
+
+    wrapper = OpenRouterWrapper(model_name="openai/gpt-3.5-turbo", api_key="test-key")
+
+    def _raise_error(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("connection failed")
+
+    monkeypatch.setattr(wrapper.client.chat.completions, "create", _raise_error)
+    assert wrapper.generate("test prompt") == ""
+
+
+def test_openrouter_wrapper_get_logits_not_supported(monkeypatch):
+    _install_fake_tiktoken(monkeypatch)
+    client = _FakeOpenAIClient(fail_batch_create=False)
+    _install_fake_openai(monkeypatch, client)
+
+    wrapper = OpenRouterWrapper(model_name="openai/gpt-3.5-turbo", api_key="test-key")
+    with pytest.raises(NotImplementedError, match="OpenRouter API models don't provide logits access"):
+        wrapper.get_logits("hello")
+
+
+def test_openrouter_wrapper_tokenizer_fallback_without_tiktoken(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tiktoken", None)
+    client = _FakeOpenAIClient(fail_batch_create=False)
+    _install_fake_openai(monkeypatch, client)
+
+    wrapper = OpenRouterWrapper(model_name="openai/gpt-3.5-turbo", api_key="test-key")
+
+    assert wrapper.tokenizer is None
+    assert wrapper.tokenize("Az") == [65, 122]
+    assert wrapper.detokenize([1, 2, 3]) == "1 2 3"
+    assert wrapper.get_vocab_size() == 0
+
+
 def test_gemini_wrapper_generate_batch_chunks_and_merges(monkeypatch):
     _install_fake_tiktoken(monkeypatch)
     wrapper = GeminiWrapper(model_name="gemini-2.0-flash", api_key="test-key")
@@ -356,6 +463,31 @@ def test_model_loader_auto_detects_and_loads_gemini(monkeypatch):
     assert model.kwargs == {"batch_max_requests": 128}
 
 
+def test_model_loader_auto_detects_and_loads_openrouter(monkeypatch):
+    class _FakeOpenRouterWrapper:
+        def __init__(self, model_name, api_key=None, **kwargs):
+            self.model_name = model_name
+            self.api_key = api_key
+            self.kwargs = kwargs
+
+    model_loader_module = importlib.import_module("reptrace.models.ModelLoader")
+    monkeypatch.setattr(model_loader_module, "OpenRouterWrapper", _FakeOpenRouterWrapper)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-test-key")
+
+    loader = ModelLoader()
+    assert loader._detect_model_type("openrouter/pony-alpha") == "openrouter"
+
+    model = loader.load_model(
+        "openrouter/pony-alpha",
+        model_type="auto",
+        batch_max_requests=64,
+    )
+    assert isinstance(model, _FakeOpenRouterWrapper)
+    assert model.model_name == "openrouter/pony-alpha"
+    assert model.api_key == "openrouter-test-key"
+    assert model.kwargs == {"batch_max_requests": 64}
+
+
 def test_openai_wrapper_single_generate(monkeypatch):
     """Test single prompt generation without batch API."""
     _install_fake_tiktoken(monkeypatch)
@@ -369,8 +501,8 @@ def test_openai_wrapper_single_generate(monkeypatch):
     assert client.batch_counter == 0  # No batch API used
 
 
-def test_model_loader_detects_newer_openai_models(monkeypatch):
-    """Verify auto-detection covers newer OpenAI model patterns."""
+def test_model_loader_detects_provider_model_patterns(monkeypatch):
+    """Verify auto-detection covers OpenAI, OpenRouter, and Gemini patterns."""
     from reptrace.models.ModelLoader import ModelLoader
 
     loader = ModelLoader()
@@ -378,6 +510,10 @@ def test_model_loader_detects_newer_openai_models(monkeypatch):
     assert loader._detect_model_type("o1-preview") == "openai"
     assert loader._detect_model_type("o3-mini") == "openai"
     assert loader._detect_model_type("GPT-4-turbo-2024") == "openai"  # Case insensitive
+    assert loader._detect_model_type("openrouter/pony-alpha") == "openrouter"
+    assert loader._detect_model_type("openai/gpt-4o-mini") == "openrouter"
+    assert loader._detect_model_type("anthropic/claude-3.5-sonnet") == "openrouter"
+    assert loader._detect_model_type("google/gemini-2.0-flash") == "openrouter"
     assert loader._detect_model_type("gemini-2.0-flash") == "gemini"
     assert loader._detect_model_type("Gemini-1.5-pro") == "gemini"  # Case insensitive
     assert loader._detect_model_type("meta-llama/Llama-3-8B") == "huggingface"  # Default
@@ -397,18 +533,30 @@ def test_model_loader_supports_legacy_env_key_aliases(monkeypatch):
             self.api_key = api_key
             self.kwargs = kwargs
 
+    class _FakeOpenRouterWrapper:
+        def __init__(self, model_name, api_key=None, **kwargs):
+            self.model_name = model_name
+            self.api_key = api_key
+            self.kwargs = kwargs
+
     model_loader_module = importlib.import_module("reptrace.models.ModelLoader")
     monkeypatch.setattr(model_loader_module, "OpenAIWrapper", _FakeOpenAIWrapper)
     monkeypatch.setattr(model_loader_module, "GeminiWrapper", _FakeGeminiWrapper)
+    monkeypatch.setattr(model_loader_module, "OpenRouterWrapper", _FakeOpenRouterWrapper)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_KEY", raising=False)
     monkeypatch.setenv("APIKEY_OPENAI", "openai-legacy-key")
     monkeypatch.setenv("APIKEY_GOOGLE", "gemini-legacy-key")
+    monkeypatch.setenv("APIKEY_OPENROUTER", "openrouter-legacy-key")
 
     loader = ModelLoader()
     openai_model = loader.load_model("gpt-4o", model_type="openai")
     gemini_model = loader.load_model("gemini-2.0-flash", model_type="gemini")
+    openrouter_model = loader.load_model("openrouter/pony-alpha", model_type="openrouter")
 
     assert openai_model.api_key == "openai-legacy-key"
     assert gemini_model.api_key == "gemini-legacy-key"
+    assert openrouter_model.api_key == "openrouter-legacy-key"
