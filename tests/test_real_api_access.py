@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from reptrace.models.ModelWrapper import GeminiWrapper, OpenAIWrapper
+from reptrace.models.ModelWrapper import GeminiWrapper, OpenAIWrapper, OpenRouterWrapper
 
 
 class _SecretValue:
@@ -108,6 +108,36 @@ def _run_one_question_gemini(api_key: _SecretValue) -> str:
     raise AssertionError(f"Gemini access failed for all test models. Last error: {last_error}")
 
 
+def _run_one_question_openrouter(api_key: _SecretValue) -> str:
+    model_candidates = [
+        os.getenv("REPTRACE_OPENROUTER_TEST_MODEL", "").strip() or "openrouter/pony-alpha",
+    ]
+    prompt = "Reply with one short token: ACCESS_OK"
+    last_error: str | None = None
+
+    for model_name in model_candidates:
+        try:
+            wrapper = OpenRouterWrapper(model_name=model_name, api_key=api_key.value)
+            response = wrapper.generate(
+                prompt,
+                max_length=16,
+                temperature=0.0,
+                do_sample=False,
+                top_p=1.0,
+            )
+            if response and response.strip():
+                print(f"\n[OpenRouter API Response]")
+                print(f"  Model: {model_name}")
+                print(f"  Prompt: {prompt}")
+                print(f"  Response: {response.strip()}")
+                return response.strip()
+            last_error = f"empty response for model={model_name}"
+        except Exception as exc:
+            last_error = str(exc)
+
+    raise AssertionError(f"OpenRouter access failed for all test models. Last error: {last_error}")
+
+
 @pytest.mark.slow
 def test_real_openai_api_access_for_one_question():
     if os.getenv("REPTRACE_RUN_REAL_API_TESTS", "").strip() != "1":
@@ -136,3 +166,19 @@ def test_real_gemini_api_access_for_one_question():
 
     gemini_response = _run_one_question_gemini(_SecretValue(gemini_key))
     assert gemini_response
+
+
+@pytest.mark.slow
+def test_real_openrouter_api_access_for_one_question():
+    if os.getenv("REPTRACE_RUN_REAL_API_TESTS", "").strip() != "1":
+        pytest.skip("Set REPTRACE_RUN_REAL_API_TESTS=1 to run real provider access tests.")
+
+    env_file_values = _load_env_file(Path(__file__).resolve().parents[1] / ".env")
+    openrouter_key = _get_env_key(
+        ["OPENROUTER_API_KEY", "APIKEY_OPENROUTER", "OPENROUTER_KEY"], env_file_values
+    )
+    if not openrouter_key:
+        pytest.skip("No OpenRouter API key found in environment or .env.")
+
+    openrouter_response = _run_one_question_openrouter(_SecretValue(openrouter_key))
+    assert openrouter_response

@@ -8,7 +8,7 @@ from pathlib import Path
 import logging
 
 import torch
-from .ModelWrapper import (LLMWrapper, HuggingFaceWrapper, OpenAIWrapper, GeminiWrapper,
+from .ModelWrapper import (LLMWrapper, HuggingFaceWrapper, OpenAIWrapper, OpenRouterWrapper, GeminiWrapper,
                            DecoderOnlyWrapper, EncoderOnlyWrapper, EncoderDecoderWrapper)
 
 
@@ -31,7 +31,7 @@ class ModelLoader:
         
         Args:
             model_path_or_name: Path to local model or HuggingFace model name
-            model_type: Type of model ("auto", "huggingface", "openai", "gemini", "anthropic")
+            model_type: Type of model ("auto", "huggingface", "openai", "openrouter", "gemini", "anthropic")
             device: Device for computation
             **kwargs: Additional arguments for model loading
             
@@ -48,10 +48,12 @@ class ModelLoader:
             return self._load_huggingface_model(model_path_or_name, device, **kwargs)
         elif model_type == "openai":
             return self._load_openai_model(model_path_or_name, **kwargs)
+        elif model_type == "openrouter":
+            return self._load_openrouter_model(model_path_or_name, **kwargs)
         elif model_type == "gemini":
             return self._load_gemini_model(model_path_or_name, **kwargs)
         else:
-            raise ValueError(f"Unsupported model type: {model_type}. Supported: huggingface, openai, gemini")
+            raise ValueError(f"Unsupported model type: {model_type}. Supported: huggingface, openai, openrouter, gemini")
             
     def _detect_model_type(self, model_path_or_name: str) -> str:
         """Auto-detect model type based on path/name patterns."""
@@ -228,6 +230,40 @@ class ModelLoader:
             **wrapper_kwargs
         )
 
+    def _load_openrouter_model(
+        self,
+        model_name: str,
+        api_key: Optional[str] = None,
+        **kwargs
+    ) -> OpenRouterWrapper:
+        """Load OpenRouter model."""
+        # Get API key from environment if not provided
+        if api_key is None:
+            api_key = (
+                os.getenv("OPENROUTER_API_KEY")
+                or os.getenv("APIKEY_OPENROUTER")
+                or os.getenv("OPENROUTER_KEY")
+            )
+            
+        if api_key is None:
+            raise ValueError("OpenRouter API key required. Set OPENROUTER_API_KEY environment variable.")
+
+        allowed_kwargs = {
+            "batch_poll_interval_seconds",
+            "batch_timeout_seconds",
+            "batch_max_requests",
+            "prefer_batch_api",
+            "http_referer",
+            "x_title",
+        }
+        wrapper_kwargs = {key: value for key, value in kwargs.items() if key in allowed_kwargs}
+            
+        return OpenRouterWrapper(
+            model_name=model_name,
+            api_key=api_key,
+            **wrapper_kwargs
+        )
+
     def _load_gemini_model(
         self,
         model_name: str,
@@ -296,6 +332,8 @@ class ModelLoader:
             return self._list_huggingface_models()
         elif model_type == "openai":
             return self._list_openai_models()
+        elif model_type == "openrouter":
+            return self._list_openrouter_models()
         elif model_type == "gemini":
             return self._list_gemini_models()
         else:
@@ -358,6 +396,32 @@ class ModelLoader:
             ]
         }
 
+    def _list_openrouter_models(self) -> Dict[str, Any]:
+        """List available OpenRouter models (popular examples)."""
+        return {
+            "openai_models": [
+                "openai/gpt-4o",
+                "openai/gpt-4o-mini",
+                "openai/gpt-4-turbo",
+                "openai/gpt-3.5-turbo",
+            ],
+            "anthropic_models": [
+                "anthropic/claude-3.5-sonnet",
+                "anthropic/claude-3-opus",
+                "anthropic/claude-3-haiku",
+            ],
+            "meta_models": [
+                "meta-llama/llama-3.1-405b-instruct",
+                "meta-llama/llama-3.1-70b-instruct",
+                "meta-llama/llama-3.1-8b-instruct",
+            ],
+            "google_models": [
+                "google/gemini-pro-1.5",
+                "google/gemini-flash-1.5",
+            ],
+            "note": "OpenRouter provides access to 200+ models. See https://openrouter.ai/models for full list."
+        }
+
     def _list_gemini_models(self) -> Dict[str, Any]:
         """List available Gemini models."""
         return {
@@ -389,7 +453,7 @@ class ModelLoader:
         
         if model_type == "huggingface":
             info.update(self._get_huggingface_info(model_path_or_name))
-        elif model_type in ["openai", "gemini", "anthropic"]:
+        elif model_type in ["openai", "openrouter", "gemini", "anthropic"]:
             info.update({"requires_api_key": True})
             
         return info
@@ -426,7 +490,7 @@ def load_model(
     
     Args:
         model_path_or_name: Model identifier
-        model_type: Model type ("auto", "huggingface", "openai", "gemini", "anthropic")
+        model_type: Model type ("auto", "huggingface", "openai", "openrouter", "gemini", "anthropic")
         device: Computation device
         config_dict: Model configuration dictionary
         **kwargs: Additional model loading arguments

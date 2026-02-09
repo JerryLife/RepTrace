@@ -1431,6 +1431,387 @@ class OpenAIWrapper(LLMWrapper):
         }
 
 
+class OpenRouterWrapper(LLMWrapper):
+    """Wrapper for OpenRouter API models (compatible with OpenAI API)."""
+    
+    def __init__(
+        self,
+        model_name: str,
+        api_key: Optional[str] = None,
+        device: str = "cpu",  # API models don't use local device
+        batch_poll_interval_seconds: float = 10.0,
+        batch_timeout_seconds: Optional[float] = None,
+        batch_max_requests: int = 512,
+        prefer_batch_api: bool = True,
+        http_referer: Optional[str] = None,
+        x_title: Optional[str] = None,
+    ):
+        super().__init__(model_name, device)
+        # Get API key from environment if not provided
+        api_key = (
+            api_key 
+            or os.getenv("OPENROUTER_API_KEY") 
+            or os.getenv("APIKEY_OPENROUTER")
+            or os.getenv("OPENROUTER_KEY")
+        )
+        
+        if not api_key:
+            raise ValueError("OpenRouter API key required. Set OPENROUTER_API_KEY environment variable.")
+        
+        try:
+            import openai
+            # OpenRouter uses OpenAI-compatible API but with different base URL
+            self.client = openai.OpenAI(
+                api_key=api_key,
+                base_url="https://openrouter.ai/api/v1"
+            )
+        except ImportError:
+            raise ImportError("OpenAI package not installed. Install with: pip install openai")
+
+        self.batch_poll_interval_seconds = max(0.1, float(batch_poll_interval_seconds))
+        self.batch_timeout_seconds = batch_timeout_seconds
+        self.batch_max_requests = max(1, int(batch_max_requests))
+        self.prefer_batch_api = bool(prefer_batch_api)
+        self.http_referer = http_referer or os.getenv("OPENROUTER_HTTP_REFERER")
+        self.x_title = x_title or os.getenv("OPENROUTER_X_TITLE")
+            
+        # OpenRouter models don't have local tokenizers, use tiktoken
+        try:
+            import tiktoken
+            self.tokenizer = tiktoken.encoding_for_model(model_name)
+        except Exception:
+            try:
+                import tiktoken
+                self.tokenizer = tiktoken.get_encoding("cl100k_base")  # Default encoding
+            except Exception:
+                self.tokenizer = None
+
+    def _get_extra_headers(self) -> Dict[str, str]:
+        """Get extra headers for OpenRouter API requests."""
+        headers = {}
+        if self.http_referer:
+            headers["HTTP-Referer"] = self.http_referer
+        if self.x_title:
+            headers["X-Title"] = self.x_title
+        return headers
+
+    @staticmethod
+    def _extract_openai_text(choice: Dict[str, Any]) -> str:
+        """Extract text from OpenAI-compatible response choice."""
+        message = choice.get("message", {}) if isinstance(choice, dict) else {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            return "\n".join(parts).strip()
+        return ""
+
+    @staticmethod
+    def _parse_custom_id(custom_id: Any) -> Optional[int]:
+        """Parse custom_id from batch request."""
+        if not isinstance(custom_id, str):
+            return None
+        prefix = "prompt_"
+        if not custom_id.startswith(prefix):
+            return None
+        try:
+            return int(custom_id[len(prefix):])
+        except ValueError:
+            return None
+
+    def _build_openai_batch_requests(
+        self,
+        prompts: List[str],
+        start_index: int,
+        max_length: int,
+        temperature: float,
+        do_sample: bool,
+        top_p: float,
+        request_kwargs: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build batch requests for OpenRouter API."""
+        requests: List[Dict[str, Any]] = []
+        for offset, prompt in enumerate(prompts):
+            request = {
+                "custom_id": f"prompt_{start_index + offset}",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": int(max_length),
+                    "temperature": float(temperature),
+                    "top_p": float(top_p if do_sample else 1.0),
+                    **request_kwargs,
+                },
+            }
+            requests.append(request)
+        return requests
+
+    def _submit_openai_batch(self, requests: List[Dict[str, Any]], completion_window: str) -> str:
+        """Submit batch requests to OpenRouter API."""
+        payload_lines = [json.dumps(request, ensure_ascii=False) for request in requests]
+        payload = "\n".join(payload_lines).encode("utf-8")
+        file_obj = io.BytesIO(payload)
+        file_obj.name = "reptrace_batch_requests.jsonl"
+        uploaded = self.client.files.create(file=file_obj, purpose="batch")
+        batch = self.client.batches.create(
+            input_file_id=uploaded.id,
+            endpoint="/v1/chat/completions",
+            completion_window=completion_window,
+        )
+        self.logger.info("OpenRouter batch submitted: id=%s size=%d", batch.id, len(requests))
+        return batch.id
+
+    def _wait_openai_batch(
+        self,
+        batch_id: str,
+        poll_interval_seconds: float,
+        timeout_seconds: Optional[float],
+    ) -> Any:
+        """Wait for batch completion."""
+        started = time.time()
+        last_status: Optional[str] = None
+        while True:
+            batch = self.client.batches.retrieve(batch_id)
+            status = str(getattr(batch, "status", "")).lower()
+            if status != last_status:
+                self.logger.info("OpenRouter batch %s status=%s", batch_id, status)
+                last_status = status
+
+            if status in {"completed", "done"}:
+                return batch
+            if status in {"failed", "cancelled", "canceled", "expired", "error"}:
+                error_obj = getattr(batch, "error", None)
+                raise RuntimeError(f"OpenRouter batch {batch_id} failed with status={status}: {error_obj}")
+
+            if timeout_seconds is not None and (time.time() - started) > timeout_seconds:
+                try:
+                    self.client.batches.cancel(batch_id)
+                except Exception:
+                    pass
+                raise TimeoutError(f"OpenRouter batch {batch_id} timed out after {timeout_seconds}s")
+
+            time.sleep(max(0.1, poll_interval_seconds))
+
+    def _download_openai_output(self, output_file_id: str) -> bytes:
+        """Download batch output file."""
+        output = self.client.files.content(output_file_id)
+        if isinstance(output, bytes):
+            return output
+        if isinstance(output, str):
+            return output.encode("utf-8")
+        if hasattr(output, "read"):
+            raw = output.read()
+            if isinstance(raw, bytes):
+                return raw
+            if isinstance(raw, str):
+                return raw.encode("utf-8")
+        raise ValueError("Unsupported OpenRouter file content type")
+
+    def _parse_openai_batch_output(self, raw_content: bytes) -> Dict[int, str]:
+        """Parse batch output JSONL."""
+        responses: Dict[int, str] = {}
+        text = raw_content.decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                self.logger.warning("Skipping invalid OpenRouter batch JSONL line: %s", line[:120])
+                continue
+
+            index = self._parse_custom_id(record.get("custom_id"))
+            if index is None:
+                continue
+
+            response_obj = record.get("response", {})
+            body = response_obj.get("body", response_obj) if isinstance(response_obj, dict) else {}
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body)
+                except json.JSONDecodeError:
+                    body = {}
+
+            choices = body.get("choices", []) if isinstance(body, dict) else []
+            if not choices:
+                responses[index] = ""
+                continue
+            responses[index] = self._extract_openai_text(choices[0])
+        return responses
+            
+    def generate(
+        self,
+        input_text: str,
+        max_length: int = 1024,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> str:
+        """Generate text from input using OpenRouter API."""
+        try:
+            # Add extra headers if available
+            extra_headers = self._get_extra_headers()
+            if extra_headers:
+                # Note: OpenAI client doesn't directly support custom headers in chat.completions.create
+                # We'll need to set them via default_headers if the client supports it
+                # For now, OpenRouter should work without these headers
+                pass
+            
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": input_text}],
+                max_tokens=max_length,
+                temperature=temperature,
+                top_p=top_p if do_sample else 1.0,
+                **kwargs
+            )
+            
+            # Extract content from response
+            choice = response.choices[0]
+            content = choice.message.content
+            
+            # For reasoning models (like pony-alpha), content might be empty but reasoning exists
+            if not content or not content.strip():
+                # Check for reasoning field in message
+                if hasattr(choice.message, 'model_dump'):
+                    msg_dict = choice.message.model_dump()
+                    # Try to get reasoning content
+                    reasoning = msg_dict.get('reasoning')
+                    if reasoning and isinstance(reasoning, str):
+                        content = reasoning
+                    elif not reasoning:
+                        # Check reasoning_details
+                        reasoning_details = msg_dict.get('reasoning_details')
+                        if isinstance(reasoning_details, list) and reasoning_details:
+                            # Extract text from reasoning_details
+                            for item in reasoning_details:
+                                if isinstance(item, dict):
+                                    text = item.get('text')
+                                    if text:
+                                        content = text
+                                        break
+            
+            return content.strip() if content else ""
+        except Exception as e:
+            self.logger.error(f"OpenRouter API error: {e}")
+            return ""
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_length: int = 1024,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> List[str]:
+        """Generate text for multiple prompts using OpenRouter API."""
+        if not prompts:
+            return []
+
+        prefer_batch_api = bool(kwargs.pop("prefer_batch_api", self.prefer_batch_api))
+        max_requests = int(kwargs.pop("batch_max_requests", self.batch_max_requests))
+        poll_interval = float(kwargs.pop("batch_poll_interval_seconds", self.batch_poll_interval_seconds))
+        timeout = kwargs.pop("batch_timeout_seconds", self.batch_timeout_seconds)
+        completion_window = str(kwargs.pop("batch_completion_window", "24h"))
+
+        # Wrapper-only kwargs should not be forwarded to the provider payload.
+        kwargs.pop("skip_chat_template", None)
+
+        if not prefer_batch_api:
+            return super().generate_batch(
+                prompts,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+                **kwargs,
+            )
+
+        responses: List[str] = [""] * len(prompts)
+        try:
+            chunks = self._iter_chunks(prompts, max(1, max_requests))
+            for start_index, prompt_chunk in chunks:
+                batch_requests = self._build_openai_batch_requests(
+                    prompts=prompt_chunk,
+                    start_index=start_index,
+                    max_length=max_length,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    top_p=top_p,
+                    request_kwargs=kwargs,
+                )
+                batch_id = self._submit_openai_batch(
+                    requests=batch_requests,
+                    completion_window=completion_window,
+                )
+                batch = self._wait_openai_batch(
+                    batch_id=batch_id,
+                    poll_interval_seconds=poll_interval,
+                    timeout_seconds=timeout,
+                )
+                output_file_id = getattr(batch, "output_file_id", None)
+                if not output_file_id:
+                    raise RuntimeError(f"OpenRouter batch {batch_id} completed without output_file_id")
+                parsed = self._parse_openai_batch_output(
+                    self._download_openai_output(output_file_id)
+                )
+                for idx, text in parsed.items():
+                    if 0 <= idx < len(responses):
+                        responses[idx] = text
+            return responses
+        except Exception as exc:
+            self.logger.warning("OpenRouter batch API failed; falling back to sequential calls: %s", exc)
+            return super().generate_batch(
+                prompts,
+                max_length=max_length,
+                temperature=temperature,
+                do_sample=do_sample,
+                top_p=top_p,
+                **kwargs,
+            )
+            
+    def get_logits(self, input_text: str) -> torch.Tensor:
+        """OpenRouter API doesn't provide logits access."""
+        raise NotImplementedError("OpenRouter API models don't provide logits access")
+        
+    def tokenize(self, text: str) -> List[int]:
+        """Tokenize text using tiktoken."""
+        if self.tokenizer is None:
+            return [ord(ch) for ch in text]
+        return self.tokenizer.encode(text)
+        
+    def detokenize(self, token_ids: List[int]) -> str:
+        """Detokenize using tiktoken."""
+        if self.tokenizer is None:
+            return " ".join(str(token_id) for token_id in token_ids)
+        return self.tokenizer.decode(token_ids)
+        
+    def get_vocab_size(self) -> int:
+        """Get vocabulary size (approximate for tiktoken)."""
+        if self.tokenizer is None:
+            return 0
+        return self.tokenizer.n_vocab
+        
+    def get_model_metadata(self) -> Dict[str, Any]:
+        """Get model metadata."""
+        return {
+            "model_name": self.model_name,
+            "model_type": "openrouter_api",
+            "vocab_size": self.get_vocab_size(),
+            "device": "api",
+            "provider": "openrouter"
+        }
+
+
 class GeminiWrapper(LLMWrapper):
     """Wrapper for Google Gemini API models, including batch mode."""
 
