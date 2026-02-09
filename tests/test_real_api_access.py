@@ -109,33 +109,29 @@ def _run_one_question_gemini(api_key: _SecretValue) -> str:
 
 
 def _run_one_question_openrouter(api_key: _SecretValue) -> str:
-    model_candidates = [
-        os.getenv("REPTRACE_OPENROUTER_TEST_MODEL", "").strip() or "openrouter/pony-alpha",
-    ]
+    model_name = os.getenv("REPTRACE_OPENROUTER_TEST_MODEL", "").strip() or "openrouter/pony-alpha"
     prompt = "Reply with one short token: ACCESS_OK"
-    last_error: str | None = None
-
-    for model_name in model_candidates:
-        try:
-            wrapper = OpenRouterWrapper(model_name=model_name, api_key=api_key.value)
-            response = wrapper.generate(
-                prompt,
-                max_length=16,
-                temperature=0.0,
-                do_sample=False,
-                top_p=1.0,
-            )
-            if response and response.strip():
-                print(f"\n[OpenRouter API Response]")
-                print(f"  Model: {model_name}")
-                print(f"  Prompt: {prompt}")
-                print(f"  Response: {response.strip()}")
-                return response.strip()
-            last_error = f"empty response for model={model_name}"
-        except Exception as exc:
-            last_error = str(exc)
-
-    raise AssertionError(f"OpenRouter access failed for all test models. Last error: {last_error}")
+    
+    try:
+        wrapper = OpenRouterWrapper(model_name=model_name, api_key=api_key.value)
+        # For reasoning models like pony-alpha, need larger max_tokens
+        # Reasoning process + final answer both need tokens
+        response = wrapper.generate(
+            prompt,
+            max_length=200,  # Reasoning models need more tokens
+            temperature=0.0,
+            do_sample=False,
+            top_p=1.0,
+        )
+        if response and response.strip():
+            print(f"\n[OpenRouter API Response]")
+            print(f"  Model: {model_name}")
+            print(f"  Prompt: {prompt}")
+            print(f"  Response: {response.strip()}")
+            return response.strip()
+        raise AssertionError(f"Empty response for model={model_name}")
+    except Exception as exc:
+        raise AssertionError(f"OpenRouter access failed for {model_name}: {exc}")
 
 
 @pytest.mark.slow

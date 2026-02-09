@@ -1677,26 +1677,51 @@ class OpenRouterWrapper(LLMWrapper):
             # Extract content from response
             choice = response.choices[0]
             content = choice.message.content
+            finish_reason = getattr(choice, 'finish_reason', None)
             
-            # For reasoning models (like pony-alpha), content might be empty but reasoning exists
+            # For reasoning models: they have both content (final answer) and reasoning (thinking process)
+            # Check if this is a reasoning model response
+            has_reasoning = False
+            if hasattr(choice.message, 'model_dump'):
+                msg_dict = choice.message.model_dump()
+                reasoning = msg_dict.get('reasoning')
+                reasoning_details = msg_dict.get('reasoning_details')
+                has_reasoning = bool(reasoning or reasoning_details)
+            
+            # If content is empty but we have reasoning, it might be due to max_tokens being too small
+            # Reasoning models need more tokens: reasoning process + final answer
             if not content or not content.strip():
-                # Check for reasoning field in message
+                if has_reasoning and finish_reason == 'length':
+                    # Response was truncated - reasoning models need larger max_tokens
+                    self.logger.warning(
+                        f"OpenRouter reasoning model {self.model_name} response was truncated (finish_reason=length). "
+                        f"Content is empty because max_tokens ({max_length}) was too small. "
+                        f"Reasoning models need more tokens for both reasoning and final answer. "
+                        f"Consider increasing max_tokens."
+                    )
+                
+                # Fallback: use reasoning if content is missing (only as last resort)
                 if hasattr(choice.message, 'model_dump'):
                     msg_dict = choice.message.model_dump()
-                    # Try to get reasoning content
                     reasoning = msg_dict.get('reasoning')
-                    if reasoning and isinstance(reasoning, str):
+                    if reasoning and isinstance(reasoning, str) and reasoning.strip():
+                        self.logger.warning(
+                            f"OpenRouter model {self.model_name} returned reasoning but no content. "
+                            f"Using reasoning as fallback. This may indicate max_tokens was too small."
+                        )
                         content = reasoning
-                    elif not reasoning:
+                    else:
                         # Check reasoning_details
                         reasoning_details = msg_dict.get('reasoning_details')
                         if isinstance(reasoning_details, list) and reasoning_details:
-                            # Extract text from reasoning_details
                             for item in reasoning_details:
                                 if isinstance(item, dict):
                                     text = item.get('text')
-                                    if text:
+                                    if text and text.strip():
                                         content = text
+                                        self.logger.warning(
+                                            f"OpenRouter model {self.model_name} returned reasoning_details but no content."
+                                        )
                                         break
             
             return content.strip() if content else ""
