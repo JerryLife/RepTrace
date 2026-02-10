@@ -7,8 +7,8 @@ import time
 import numpy as np
 import pytest
 
-import reptrace.api as api
-from reptrace.api import DNAExtractionConfig
+import llm_dna.api as api
+from llm_dna.api import DNAExtractionConfig
 
 
 def _write_llm_list(path: Path, models: list[str]) -> Path:
@@ -46,7 +46,7 @@ def test_calc_dna_parallel_uses_llm_list_and_multi_gpu(monkeypatch, tmp_path):
     devices_seen: list[str] = []
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt A", "prompt B", "prompt C"],
     )
     monkeypatch.setattr(
@@ -104,7 +104,7 @@ def test_calc_dna_parallel_uses_cached_responses(monkeypatch, tmp_path):
     llm_list = _write_llm_list(tmp_path / "llm_list.txt", model_names)
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt A", "prompt B", "prompt C"],
     )
     monkeypatch.setattr(
@@ -178,7 +178,7 @@ def test_calc_dna_parallel_uses_cached_responses_without_metadata_or_generation(
     llm_list = _write_llm_list(tmp_path / "llm_list.txt", model_names)
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt A", "prompt B", "prompt C"],
     )
     monkeypatch.setattr(
@@ -236,7 +236,7 @@ def test_calc_dna_parallel_uses_cached_responses_without_metadata_or_generation(
 
 def test_calc_dna_single_model_uses_cached_responses_without_metadata_or_generation(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt A", "prompt B", "prompt C"],
     )
     monkeypatch.setattr(
@@ -247,7 +247,7 @@ def test_calc_dna_single_model_uses_cached_responses_without_metadata_or_generat
         ),
     )
     monkeypatch.setattr(
-        "reptrace.core.extraction.extract_dna_signature",
+        "llm_dna.core.extraction.extract_dna_signature",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("core extraction should not run when single-model cache exists")
         ),
@@ -323,7 +323,7 @@ def test_calc_dna_parallel_failure_behavior(monkeypatch, tmp_path):
     llm_list = _write_llm_list(tmp_path / "llm_list.txt", model_names)
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt A", "prompt B", "prompt C"],
     )
     monkeypatch.setattr(
@@ -387,7 +387,7 @@ def test_calc_dna_parallel_gpu_round_robin_distribution(monkeypatch, tmp_path):
     model_device_map: dict[str, str] = {}
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt 1", "prompt 2"],
     )
     monkeypatch.setattr(
@@ -439,7 +439,7 @@ def test_calc_dna_parallel_single_gpu_multiple_models(monkeypatch, tmp_path):
     devices_seen: list[str] = []
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt A", "prompt B"],
     )
     monkeypatch.setattr(
@@ -505,7 +505,7 @@ def test_calc_dna_parallel_model_with_slashes_in_path(monkeypatch, tmp_path):
     llm_list = _write_llm_list(tmp_path / "llm_list.txt", model_names)
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt A", "prompt B"],
     )
     monkeypatch.setattr(
@@ -549,7 +549,7 @@ def test_calc_dna_parallel_min_samples(monkeypatch, tmp_path):
     llm_list = _write_llm_list(tmp_path / "llm_list.txt", model_names)
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["p1", "p2"],
     )
     monkeypatch.setattr(
@@ -603,7 +603,7 @@ def test_calc_dna_parallel_encoder_device_auto(monkeypatch, tmp_path):
             return np.asarray(embeddings, dtype=np.float32)
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt1", "prompt2"],
     )
     monkeypatch.setattr(
@@ -666,7 +666,7 @@ def test_calc_dna_parallel_api_uses_n_processes_workers(monkeypatch, tmp_path):
     llm_list = _write_llm_list(tmp_path / "llm_list.txt", model_names)
 
     monkeypatch.setattr(
-        "reptrace.core.extraction.get_probe_texts",
+        "llm_dna.core.extraction.get_probe_texts",
         lambda **_kwargs: ["prompt A", "prompt B"],
     )
     monkeypatch.setattr(

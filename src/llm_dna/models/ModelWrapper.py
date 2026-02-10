@@ -1246,7 +1246,7 @@ class OpenAIWrapper(LLMWrapper):
         payload_lines = [json.dumps(request, ensure_ascii=False) for request in requests]
         payload = "\n".join(payload_lines).encode("utf-8")
         file_obj = io.BytesIO(payload)
-        file_obj.name = "reptrace_batch_requests.jsonl"
+        file_obj.name = "llm-dna_batch_requests.jsonl"
         uploaded = self.client.files.create(file=file_obj, purpose="batch")
         batch = self.client.batches.create(
             input_file_id=uploaded.id,
@@ -1848,7 +1848,7 @@ class GeminiWrapper(LLMWrapper):
     def _submit_gemini_batch(self, requests: List[Dict[str, Any]]) -> str:
         payload = {
             "batch": {
-                "display_name": f"reptrace-{self.model_name}-{int(time.time())}",
+                "display_name": f"llm-dna-{self.model_name}-{int(time.time())}",
                 "input_config": {"requests": {"requests": requests}},
             }
         }

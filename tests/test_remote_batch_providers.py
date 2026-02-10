@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from reptrace.models.ModelLoader import ModelLoader
-from reptrace.models.ModelWrapper import GeminiWrapper, OpenAIWrapper, OpenRouterWrapper
+from llm_dna.models.ModelLoader import ModelLoader
+from llm_dna.models.ModelWrapper import GeminiWrapper, OpenAIWrapper, OpenRouterWrapper
 
 
 class _FakeEncoding:
@@ -470,7 +470,7 @@ def test_model_loader_auto_detects_and_loads_gemini(monkeypatch):
             self.api_key = api_key
             self.kwargs = kwargs
 
-    model_loader_module = importlib.import_module("reptrace.models.ModelLoader")
+    model_loader_module = importlib.import_module("llm_dna.models.ModelLoader")
     monkeypatch.setattr(model_loader_module, "GeminiWrapper", _FakeGeminiWrapper)
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
 
@@ -497,7 +497,7 @@ def test_model_loader_auto_detects_and_loads_openrouter(monkeypatch):
             self.api_key = api_key
             self.kwargs = kwargs
 
-    model_loader_module = importlib.import_module("reptrace.models.ModelLoader")
+    model_loader_module = importlib.import_module("llm_dna.models.ModelLoader")
     monkeypatch.setattr(model_loader_module, "OpenRouterWrapper", _FakeOpenRouterWrapper)
     monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-test-key")
 
@@ -530,7 +530,7 @@ def test_openai_wrapper_single_generate(monkeypatch):
 
 def test_model_loader_detects_provider_model_patterns(monkeypatch):
     """Verify auto-detection covers OpenAI, OpenRouter, and Gemini patterns."""
-    from reptrace.models.ModelLoader import ModelLoader
+    from llm_dna.models.ModelLoader import ModelLoader
 
     loader = ModelLoader()
     assert loader._detect_model_type("gpt-4o-mini") == "openai"
@@ -568,7 +568,7 @@ def test_model_loader_supports_legacy_env_key_aliases(monkeypatch):
             self.api_key = api_key
             self.kwargs = kwargs
 
-    model_loader_module = importlib.import_module("reptrace.models.ModelLoader")
+    model_loader_module = importlib.import_module("llm_dna.models.ModelLoader")
     monkeypatch.setattr(model_loader_module, "OpenAIWrapper", _FakeOpenAIWrapper)
     monkeypatch.setattr(model_loader_module, "GeminiWrapper", _FakeGeminiWrapper)
     monkeypatch.setattr(model_loader_module, "OpenRouterWrapper", _FakeOpenRouterWrapper)

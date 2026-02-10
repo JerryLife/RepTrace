@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from reptrace.models.ModelWrapper import GeminiWrapper, OpenAIWrapper, OpenRouterWrapper
+from llm_dna.models.ModelWrapper import GeminiWrapper, OpenAIWrapper, OpenRouterWrapper
 
 
 class _SecretValue:

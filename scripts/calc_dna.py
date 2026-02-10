@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Example script demonstrating RepTrace DNA extraction API.
+Example script demonstrating LLM-DNA DNA extraction API.
 
 Usage:
     python scripts/calc_dna.py
@@ -19,12 +19,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from reptrace import DNAExtractionConfig, calc_dna, calc_dna_parallel
+from llm_dna import DNAExtractionConfig, calc_dna, calc_dna_parallel
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract DNA vector from an LLM using RepTrace.",
+        description="Extract DNA vector from an LLM using LLM-DNA.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

@@ -1,7 +1,7 @@
-# RepTrace
+# LLM-DNA
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyPI version](https://badge.fury.io/py/reptrace.svg)](https://badge.fury.io/py/reptrace)
+[![PyPI version](https://badge.fury.io/py/llm-dna.svg)](https://badge.fury.io/py/llm-dna)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Tests](https://img.shields.io/badge/tests-17%20passed-brightgreen.svg)](#tests)
 
@@ -11,7 +11,7 @@
 
 ## Overview
 
-The explosive growth of large language models has created a vast but opaque landscape: millions of models exist, yet their evolutionary relationships through fine-tuning, distillation, or adaptation are often undocumented. **RepTrace** provides a general, scalable, training-free pipeline for extracting LLM DNA — mathematically-grounded representations that satisfy inheritance and genetic determinism properties.
+The explosive growth of large language models has created a vast but opaque landscape: millions of models exist, yet their evolutionary relationships through fine-tuning, distillation, or adaptation are often undocumented. **LLM-DNA** provides a general, scalable, training-free pipeline for extracting LLM DNA — mathematically-grounded representations that satisfy inheritance and genetic determinism properties.
 
 **Key Features:**
 - 🧬 Extract DNA vectors from any HuggingFace or local model
@@ -23,13 +23,15 @@ The explosive growth of large language models has created a vast but opaque land
 ## Installation
 
 ```bash
-pip install reptrace
+pip install llm-dna
 ```
+
+Use `llm-dna` for install/package naming, and `llm_dna` for Python imports.
 
 ## Quick Start
 
 ```python
-from reptrace import DNAExtractionConfig, calc_dna
+from llm_dna import DNAExtractionConfig, calc_dna
 
 config = DNAExtractionConfig(
     model_name="distilgpt2",
@@ -45,7 +47,7 @@ print(f"DNA shape: {result.vector.shape}")  # (128,)
 ## Python API
 
 ```python
-from reptrace import DNAExtractionConfig, calc_dna
+from llm_dna import DNAExtractionConfig, calc_dna
 
 config = DNAExtractionConfig(
     model_name="Qwen/Qwen2.5-0.5B-Instruct",
@@ -103,7 +105,7 @@ pytest tests/ -m "not slow"
 
 ## Citation
 
-If you use RepTrace in your research, please cite:
+If you use LLM-DNA in your research, please cite:
 
 ```bibtex
 @inproceedings{wu2026llmdna,

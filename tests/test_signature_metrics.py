@@ -1,5 +1,5 @@
 import numpy as np
-from reptrace.dna import DNASignature, DNAMetadata
+from llm_dna.dna import DNASignature, DNAMetadata
 
 
 def test_signature_distance_and_similarity():

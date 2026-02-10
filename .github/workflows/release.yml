@@ -103,7 +103,7 @@ jobs:
       id-token: write
     environment:
       name: pypi
-      url: https://pypi.org/p/reptrace
+      url: https://pypi.org/p/llm-dna
 
     steps:
       - name: Download Dist Artifact

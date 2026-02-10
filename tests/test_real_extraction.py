@@ -11,7 +11,7 @@ import pytest
 import torch
 from huggingface_hub import snapshot_download
 
-from reptrace import DNAExtractionConfig, calc_dna
+from llm_dna import DNAExtractionConfig, calc_dna
 
 MODEL_NAME = "distilgpt2"
 MODEL_DEVICE = "cuda:0"

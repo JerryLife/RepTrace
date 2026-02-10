@@ -1,4 +1,4 @@
-"""RepTrace: LLM DNA extraction toolkit."""
+"""LLM-DNA: LLM DNA extraction toolkit."""
 
 __all__ = [
     "__version__",
@@ -9,7 +9,7 @@ __all__ = [
     "calc_dna_batch",
 ]
 
-__version__ = "0.1.1b1"
+__version__ = "0.0.1"
 
 
 def __getattr__(name: str):
@@ -36,4 +36,4 @@ def __getattr__(name: str):
             "calc_dna_batch": calc_dna_batch,
         }
         return exports[name]
-    raise AttributeError(f"module 'reptrace' has no attribute {name!r}")
+    raise AttributeError(f"module 'llm_dna' has no attribute {name!r}")

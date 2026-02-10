@@ -1,4 +1,4 @@
-"""CLI entrypoint for RepTrace DNA extraction."""
+"""CLI entrypoint for LLM-DNA DNA extraction."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def _parse_gpu_ids(raw_gpus: str) -> List[int]:
 def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Extract DNA vectors from LLMs using RepTrace.",
+        description="Extract DNA vectors from LLMs using LLM-DNA.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 

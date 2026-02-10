@@ -1,4 +1,4 @@
-"""RepTrace core extraction module."""
+"""LLM-DNA core extraction module."""
 
 from .extraction import (
     load_model_metadata,

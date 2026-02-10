@@ -1,5 +1,5 @@
-from reptrace.data import DatasetLoader
-from reptrace.data import generate_rand_dataset as grd
+from llm_dna.data import DatasetLoader
+from llm_dna.data import generate_rand_dataset as grd
 
 
 def test_rand_dataset_autogeneration(monkeypatch, tmp_path):

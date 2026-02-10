@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import numpy as np
 
-import reptrace.api as api
-from reptrace.api import DNAExtractionConfig
-from reptrace.cli import main as cli_main
+import llm_dna.api as api
+from llm_dna.api import DNAExtractionConfig
+from llm_dna.cli import main as cli_main
 
 
 def _fake_result(model_name: str, dim: int) -> SimpleNamespace:
